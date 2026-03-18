@@ -297,6 +297,8 @@ Please make your own config file refer to the config files in config folder. Her
   <br> The ordinal number of the lane line in the segmentation model 
 * pole_class
   <br> The ordinal number of the pole in the segmentation model 
+* road_class
+  <br> The ordinal number of the road in the segmentation model. When provided, `make_vector.py` will publish the road semantic point cloud on the `RoadCloud` topic and save it to `road.pcd`.
 * vector
   <br> Whether to generate the vectormap. Used by make_vector.py. 
 * predict_func
