@@ -167,6 +167,7 @@ args.bag = (args.bag or config['bag_file'])
 args.fastfoward = (args.fastfoward or config['start_time'])
 args.duration = (args.duration or config['play_time'])
 args.undistortion = (args.undistortion or config['cloud_distortion'])
+road_class = config.get('road_class', 13)
 
 color_classes = get_colors(config['cmap'])
 K = config['intrinsic'] or K
@@ -182,6 +183,7 @@ rospy.init_node('fix_distortion', anonymous=False, log_level=rospy.DEBUG)
 fixCloudPubHandle = rospy.Publisher('dedistortion_cloud', PointCloud2, queue_size=5)
 originCloudPubHandle = rospy.Publisher('origin_cloud', PointCloud2, queue_size=5)
 semanticCloudPubHandle = rospy.Publisher('SemanticCloud', PointCloud2, queue_size=5)
+roadCloudPubHandle = rospy.Publisher('RoadCloud', PointCloud2, queue_size=5)
 vecCloudPubHandle = rospy.Publisher('vec_cloud', PointCloud2, queue_size=5)
 imgPubHandle = rospy.Publisher('Img', Image, queue_size=5)
 groundTruthPubHandle = rospy.Publisher('ground_truth', Path, queue_size=0)
@@ -365,6 +367,11 @@ for msg in bagread:
                             print('rgb pc generation used %.2f\nepoch total used %2.f' % (perf_time_end - perf_time_start,perf_time_end - perf_all_start))
                             sem_msg.header.frame_id = 'world'
                             semanticCloudPubHandle.publish(sem_msg)
+                            road_world_pcd = sem_world_pcd[sem_world_pcd[:, 3] == road_class]
+                            if len(road_world_pcd) != 0:
+                                road_msg = get_rgba_pcd_msg(road_world_pcd)
+                                road_msg.header.frame_id = 'world'
+                                roadCloudPubHandle.publish(road_msg)
                             print('semantic point publish')
                     # queue out
                         image_remove.append(imgtopicmsg)
