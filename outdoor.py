@@ -244,6 +244,7 @@ briconvert = config['image_compressed'] and bri.compressed_imgmsg_to_cv2 or bri.
 store_file = open(config['save_folder']+'/outdoor.pkl','wb')
 index = 0
 pose_save = []
+road_save = []
 
 for msg in bagread:
     #Handle(msg)
@@ -369,6 +370,7 @@ for msg in bagread:
                             semanticCloudPubHandle.publish(sem_msg)
                             road_world_pcd = sem_world_pcd[sem_world_pcd[:, 3] == road_class]
                             if len(road_world_pcd) != 0:
+                                road_save.append(road_world_pcd)
                                 road_msg = get_rgba_pcd_msg(road_world_pcd)
                                 road_msg.header.frame_id = 'world'
                                 roadCloudPubHandle.publish(road_msg)
@@ -391,3 +393,5 @@ for msg in bagread:
 pose_save=np.stack(pose_save)
 np.savetxt(config['save_folder']+'/pose.csv',pose_save,delimiter=',')
 store_file.close()
+if len(road_save) != 0:
+    save_nppc(np.vstack(road_save), config['save_folder']+'/road.pcd')
