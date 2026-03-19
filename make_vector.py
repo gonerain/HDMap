@@ -30,6 +30,7 @@ global odom_trans
 global last_points
 global vectors
 global lanepcd
+global roadCloudPubHandle
 
 
 class myqueue(list):
@@ -152,6 +153,7 @@ def process():
     global last_points
     global vectors
     global lanepcd
+    global roadCloudPubHandle
 
     if args.trajectory:
         p = poses[index]
@@ -207,11 +209,20 @@ def process():
     index += 1
 
 
+    display_pcd = sempcd
     if args.filters:
-        sempcd = sempcd[np.in1d(sempcd[:, 3], args.filters)]
-    sem_msg = get_rgba_pcd_msg(sempcd)
+        display_pcd = display_pcd[np.in1d(display_pcd[:, 3], args.filters)]
+    sem_msg = get_rgba_pcd_msg(display_pcd)
     sem_msg.header.frame_id = 'world'
     semanticCloudPubHandle.publish(sem_msg)
+
+    road_class = config.get('road_class')
+    if road_class is not None:
+        road_pcd = sempcd[sempcd[:, 3] == road_class]
+        if len(road_pcd) != 0:
+            road_msg = get_rgba_pcd_msg(road_pcd)
+            road_msg.header.frame_id = 'world'
+            roadCloudPubHandle.publish(road_msg)
 
     if args.semantic and index < len(simgs):
         simg = cv2.imread(simgs[index],0)
@@ -253,6 +264,7 @@ step = 1
 # start ros
 rospy.init_node('fix_distortion', anonymous=False, log_level=rospy.DEBUG)
 semanticCloudPubHandle = rospy.Publisher('SemanticCloud', PointCloud2, queue_size=5)
+roadCloudPubHandle = rospy.Publisher('RoadCloud', PointCloud2, queue_size=5)
 vecPubHandle = rospy.Publisher('VectorCloud', PointCloud2, queue_size=5)
 testPubHandle = rospy.Publisher('TestCloud', PointCloud2, queue_size=5)
 semimgPubHandle = rospy.Publisher('SemanticImg',Image,queue_size = 5)
@@ -319,10 +331,18 @@ if args.vector:
 
 if args.save is not None:
     save_nppc(savepcd,args.save)
-    lane = np.vstack(vectors)
-    p = np.vstack(poles)
-    v = np.vstack((lane,p))
-    save_nppc(v,'/'.join(args.save.split('/')[:-1])+'/vector.pcd')
+
+    road_class = config.get('road_class')
+    if road_class is not None:
+        road = savepcd[savepcd[:, 3] == road_class]
+        if len(road) != 0:
+            save_nppc(road, '/'.join(args.save.split('/')[:-1]) + '/road.pcd')
+
+    if args.vector and len(vectors) != 0:
+        lane = np.vstack(vectors)
+        p = np.vstack(poles)
+        v = np.vstack((lane,p))
+        save_nppc(v,'/'.join(args.save.split('/')[:-1])+'/vector.pcd')
 
 
 
