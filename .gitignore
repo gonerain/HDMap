@@ -3,3 +3,5 @@ make_pcl.py
 *.pkl
 result/
 __pycache__/
+demo_*/
+*.pyc
