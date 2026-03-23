@@ -106,7 +106,7 @@ def pcd_trans(pcd,dt,dr,inverse = False):
     return transedpcd
 
 
-def pointcloud_to_bev(points, resolution=0.2, x_range=None, y_range=None, z_range=None, min_points_per_cell=1):
+def pointcloud_to_bev(points, resolution=0.2, x_range=None, y_range=None, z_range=None, min_points_per_cell=1, padding=0.0):
     points = np.asarray(points)
     if points.ndim != 2 or points.shape[1] < 3:
         raise ValueError('points must be an Nx3 or wider array')
@@ -114,6 +114,8 @@ def pointcloud_to_bev(points, resolution=0.2, x_range=None, y_range=None, z_rang
         raise ValueError('resolution must be positive')
     if min_points_per_cell < 1:
         raise ValueError('min_points_per_cell must be >= 1')
+    if padding < 0:
+        raise ValueError('padding must be >= 0')
 
     xyz = points[:, :3].astype(np.float32, copy=False)
     valid = np.isfinite(xyz).all(axis=1)
@@ -186,12 +188,12 @@ def pointcloud_to_bev(points, resolution=0.2, x_range=None, y_range=None, z_rang
         }
 
     origin_xy = np.array([
-        x_range[0] if x_range is not None else xyz[:, 0].min(),
-        y_range[0] if y_range is not None else xyz[:, 1].min(),
+        x_range[0] if x_range is not None else xyz[:, 0].min() - padding,
+        y_range[0] if y_range is not None else xyz[:, 1].min() - padding,
     ], dtype=np.float32)
     max_xy = np.array([
-        x_range[1] if x_range is not None else xyz[:, 0].max(),
-        y_range[1] if y_range is not None else xyz[:, 1].max(),
+        x_range[1] if x_range is not None else xyz[:, 0].max() + padding,
+        y_range[1] if y_range is not None else xyz[:, 1].max() + padding,
     ], dtype=np.float32)
 
     span = np.maximum(max_xy - origin_xy, resolution)
@@ -302,18 +304,127 @@ def keep_largest_connected_component(binary_img):
     return output
 
 
-def stack_nonempty(items, min_cols=4):
-    arrays = []
-    for item in items:
-        arr = np.asarray(item)
-        if arr.ndim != 2:
-            continue
-        if arr.shape[1] < min_cols or len(arr) == 0:
-            continue
-        arrays.append(arr)
-    if not arrays:
-        return np.zeros((0, min_cols), dtype=np.float32)
-    return np.vstack(arrays)
+def rotate_mask_to_major_axis(binary_img):
+    mask = np.asarray(binary_img)
+    if mask.ndim != 2:
+        raise ValueError('binary_img must be a 2D array')
+
+    mask_u8 = (mask > 0).astype(np.uint8) * 255
+    points = cv2.findNonZero(mask_u8)
+    if points is None or len(points) < 5:
+        return {
+            'mask': mask_u8,
+            'angle_deg': 0.0,
+            'center': (mask_u8.shape[1] * 0.5, mask_u8.shape[0] * 0.5),
+            'matrix': np.eye(2, 3, dtype=np.float32),
+        }
+
+    rect = cv2.minAreaRect(points)
+    (cx, cy), (w, h), angle = rect
+    if w < h:
+        angle += 90.0
+
+    rot_mat = cv2.getRotationMatrix2D((cx, cy), angle, 1.0)
+    height, width = mask_u8.shape[:2]
+    cos = abs(rot_mat[0, 0])
+    sin = abs(rot_mat[0, 1])
+    new_width = int(np.ceil(width * cos + height * sin))
+    new_height = int(np.ceil(width * sin + height * cos))
+
+    rot_mat[0, 2] += new_width * 0.5 - cx
+    rot_mat[1, 2] += new_height * 0.5 - cy
+
+    rotated = cv2.warpAffine(
+        mask_u8,
+        rot_mat,
+        (new_width, new_height),
+        flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    return {
+        'mask': rotated,
+        'angle_deg': float(angle),
+        'center': (float(cx), float(cy)),
+        'matrix': rot_mat.astype(np.float32),
+    }
+
+
+# Morphological thinning without opencv-contrib; suitable for extracting a coarse centerline.
+def skeletonize_mask(binary_img):
+    mask = np.asarray(binary_img)
+    if mask.ndim != 2:
+        raise ValueError('binary_img must be a 2D array')
+
+    work = (mask > 0).astype(np.uint8) * 255
+    skeleton = np.zeros_like(work)
+    element = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+
+    while True:
+        opened = cv2.morphologyEx(work, cv2.MORPH_OPEN, element)
+        residue = cv2.subtract(work, opened)
+        skeleton = cv2.bitwise_or(skeleton, residue)
+        work = cv2.erode(work, element)
+        if cv2.countNonZero(work) == 0:
+            break
+
+    return skeleton
+
+
+def find_longest_top_bottom_edges(binary_img):
+    if isinstance(binary_img, dict):
+        binary_img = binary_img.get('mask')
+
+    mask = np.asarray(binary_img)
+    if mask.ndim != 2:
+        raise ValueError('binary_img must be a 2D array')
+
+    mask_u8 = (mask > 0).astype(np.uint8)
+    height, width = mask_u8.shape
+    if height == 0 or width == 0:
+        return {
+            'top': None,
+            'bottom': None,
+            'line_mask': np.zeros_like(mask_u8, dtype=np.uint8),
+        }
+
+    cols = np.flatnonzero(mask_u8.any(axis=0))
+    if len(cols) == 0:
+        return {
+            'top': None,
+            'bottom': None,
+            'line_mask': np.zeros_like(mask_u8, dtype=np.uint8),
+        }
+
+    mid_col = int(cols[len(cols) // 2])
+    rows = np.flatnonzero(mask_u8[:, mid_col])
+    if len(rows) == 0:
+        return {
+            'top': None,
+            'bottom': None,
+            'line_mask': np.zeros_like(mask_u8, dtype=np.uint8),
+        }
+
+    top_point = np.array([mid_col, int(rows[0])], dtype=np.int32)
+    bottom_point = np.array([mid_col, int(rows[-1])], dtype=np.int32)
+
+    line_mask = np.zeros_like(mask_u8, dtype=np.uint8)
+    line_mask[top_point[1], top_point[0]] = 255
+    line_mask[bottom_point[1], bottom_point[0]] = 255
+
+    return {
+        'top': {
+            'point': top_point,
+            'points': top_point.reshape(1, 2),
+            'col': int(mid_col),
+        },
+        'bottom': {
+            'point': bottom_point,
+            'points': bottom_point.reshape(1, 2),
+            'col': int(mid_col),
+        },
+        'line_mask': line_mask,
+    }
 
 
 def bev_mask_to_points(bev_data, mask, z_value=None):
@@ -439,6 +550,28 @@ def get_pole_centers(pcd):
         centers.append(center)
     return centers
 
+# TODO 增加 BEV2WORLD input: frame_data out_put:
+def bev2world(frame_data):
+    mask, bev_data, pose = (frame_data["mask"],frame_data["bev"],frame_data["pose"])
+    if mask is None or mask.size == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+
+    rows, cols = np.nonzero(mask > 0)
+    if len(rows) == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+
+    resolution = float(bev_data["resolution"])
+    origin_xy = np.asarray(bev_data["origin_xy"], dtype=np.float32)
+    x = origin_xy[0] + (cols.astype(np.float32) + 0.5) * resolution
+    y = origin_xy[1] + (rows.astype(np.float32) + 0.5) * resolution
+
+    if "z_mean_map" in bev_data and bev_data["z_mean_map"].size != 0:
+        z = bev_data["z_mean_map"][rows, cols].astype(np.float32, copy=False)
+    else:
+        z = np.zeros(len(rows), dtype=np.float32)
+
+    return np.stack((x, y, z), axis=1)
+
 def process():
     global sempcd
     global args
@@ -458,24 +591,35 @@ def process():
         if args.vector:
             roads = sempcd[sempcd[:, 3] == config['road_class']]
             roadpcd.append(roads)
-            if len(roadpcd) >= window:
-                pcd_all = stack_nonempty(roadpcd)
-                if len(pcd_all) == 0:
-                    index += 1
-                    return
-                bev_data = pointcloud_to_bev(pcd_all, resolution=0.2)
+            if len(roadpcd) >= window_road:
+                roads = np.vstack(roadpcd)
+                bev_data = pointcloud_to_bev(roads, resolution=0.2, padding=5)
                 bev_img = bev_data['bev'].astype(np.uint8) * 255
+                cv2.imwrite("bev_img.png", bev_img)
                 bev_img = morph_open(bev_img, kernel_size=1, iterations=1)
                 bev_img = morph_close(bev_img, kernel_size=5, iterations=1)
                 bev_img = flood_fill_holes(bev_img)
                 road_mask = keep_largest_connected_component(bev_img)
+                cv2.imwrite("mask.png", road_mask)
+                road_mask_rotate = rotate_mask_to_major_axis(road_mask)
+                cv2.imwrite("mask_rotate.png", road_mask_rotate["mask"])
+                mask_skeletonize = skeletonize_mask(road_mask_rotate["mask"])
+                cv2.imwrite("mask_skeletonize.png", mask_skeletonize)
+                mask_line = find_longest_top_bottom_edges(road_mask_rotate["mask"])
+                cv2.imwrite("mask_line.png",mask_line["line_mask"])
+                
+
+
+                sys.exit()
                 road_masks.append({
                     "pose": p,
                     "bev": bev_data,
                     "mask": road_mask
                 })
-                index += 1
 
+
+                index += 1
+                sys.exit()
                 if len(road_masks) >= window:
                     print("len road_mask full")
                     sys.exit()
@@ -524,6 +668,7 @@ args.vector = (args.vector) or config['vector']
 # init variables
 
 window = 10
+window_road = 10
 step = 1
 
 # start ros
@@ -546,7 +691,7 @@ pole_dbs = DBSCAN(eps = 0.3,min_samples=50,n_jobs=24)
 last_points = myqueue(1)
 lanepcd = myqueue(window)
 polepcd = myqueue(window)
-roadpcd = myqueue(window)
+roadpcd = myqueue(window_road)
 pairs_all = []
 vec_world = []
 
