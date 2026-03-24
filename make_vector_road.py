@@ -19,6 +19,9 @@ import re
 from tf import transformations
 from predict import get_colors
 
+import alphashape
+from shapely.geometry import Polygon, MultiPolygon, LineString, MultiLineString, GeometryCollection
+
 height = {'pole': 5, 'lane':-1.1}
 
 global sempcd
@@ -30,6 +33,8 @@ global savepcd
 global odom_trans
 global last_points
 global vectors
+global top_vectors
+global bottom_vectors
 global lanepcd
 
 
@@ -427,13 +432,19 @@ def find_longest_top_bottom_edges(binary_img):
     }
 
 
-def bev_mask_to_points(bev_data, mask, z_value=None):
-    if mask is None or mask.size == 0:
-        return np.zeros((0, 3), dtype=np.float32)
-    rows, cols = np.nonzero(mask > 0)
-    if len(rows) == 0:
+def bev_pixels_to_points(bev_data, rows, cols, z_value=None):
+    rows = np.asarray(rows, dtype=np.int32).reshape(-1)
+    cols = np.asarray(cols, dtype=np.int32).reshape(-1)
+    if len(rows) == 0 or len(cols) == 0:
         return np.zeros((0, 3), dtype=np.float32)
 
+    height, width = bev_data['bev'].shape[:2]
+    inside = (rows >= 0) & (rows < height) & (cols >= 0) & (cols < width)
+    if not np.any(inside):
+        return np.zeros((0, 3), dtype=np.float32)
+
+    rows = rows[inside]
+    cols = cols[inside]
     resolution = float(bev_data['resolution'])
     origin_xy = np.asarray(bev_data['origin_xy'], dtype=np.float32)
     xy = np.stack((
@@ -445,6 +456,31 @@ def bev_mask_to_points(bev_data, mask, z_value=None):
     else:
         z = np.full((len(xy), 1), 0.0 if z_value is None else z_value, dtype=np.float32)
     return np.hstack((xy, z))
+
+
+def bev_mask_to_points(bev_data, mask, z_value=None):
+    if mask is None or mask.size == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    rows, cols = np.nonzero(mask > 0)
+    if len(rows) == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    return bev_pixels_to_points(bev_data, rows, cols, z_value=z_value)
+
+
+def rotated_points_to_original_pixels(points, rotation_info, output_shape):
+    points = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+    if len(points) == 0:
+        return np.zeros((0, 2), dtype=np.int32)
+
+    inv_mat = cv2.invertAffineTransform(rotation_info['matrix'])
+    homogeneous = np.hstack((points, np.ones((len(points), 1), dtype=np.float32)))
+    original = homogeneous @ inv_mat.T
+    original = np.rint(original).astype(np.int32)
+
+    height, width = output_shape[:2]
+    original[:, 0] = np.clip(original[:, 0], 0, width - 1)
+    original[:, 1] = np.clip(original[:, 1], 0, height - 1)
+    return original
 
 
 def merge_road_masks(mask_entries, resolution=0.2, min_votes=1):
@@ -550,9 +586,8 @@ def get_pole_centers(pcd):
         centers.append(center)
     return centers
 
-# TODO 增加 BEV2WORLD input: frame_data out_put:
 def bev2world(frame_data):
-    mask, bev_data, pose = (frame_data["mask"],frame_data["bev"],frame_data["pose"])
+    mask, bev_data, pose = (frame_data["mask"], frame_data["bev"], frame_data.get("pose"))
     if mask is None or mask.size == 0:
         return np.zeros((0, 3), dtype=np.float32)
 
@@ -560,17 +595,532 @@ def bev2world(frame_data):
     if len(rows) == 0:
         return np.zeros((0, 3), dtype=np.float32)
 
-    resolution = float(bev_data["resolution"])
-    origin_xy = np.asarray(bev_data["origin_xy"], dtype=np.float32)
-    x = origin_xy[0] + (cols.astype(np.float32) + 0.5) * resolution
-    y = origin_xy[1] + (rows.astype(np.float32) + 0.5) * resolution
+    local_points = bev_pixels_to_points(bev_data, rows, cols)
+    if len(local_points) == 0:
+        return np.zeros((0, 3), dtype=np.float32)
 
-    if "z_mean_map" in bev_data and bev_data["z_mean_map"].size != 0:
-        z = bev_data["z_mean_map"][rows, cols].astype(np.float32, copy=False)
+    coord_frame = frame_data.get("coord_frame", "local")
+    if coord_frame == "world" or pose is None or len(pose) < 7:
+        return local_points.astype(np.float32, copy=False)
+
+    return pcd_trans(local_points, pose[:3], pose[3:7], False).astype(np.float32, copy=False)
+
+#TODO 道路延伸方向, 如果之前有dirc，则滤波
+def find_dirc(pcd, pcd_last=None, dirc=None):
+    def _stack_points(data):
+        if data is None:
+            return np.zeros((0, 3), dtype=np.float32)
+        if isinstance(data, (list, tuple)):
+            clouds = []
+            for item in data:
+                arr = np.asarray(item)
+                if arr.ndim == 2 and arr.shape[1] >= 2 and len(arr) != 0:
+                    if arr.shape[1] >= 3:
+                        clouds.append(arr[:, :3])
+                    else:
+                        clouds.append(np.pad(arr[:, :2], ((0, 0), (0, 1))))
+            if not clouds:
+                return np.zeros((0, 3), dtype=np.float32)
+            return np.vstack(clouds).astype(np.float32, copy=False)
+        arr = np.asarray(data)
+        if arr.ndim != 2 or arr.shape[1] < 2 or len(arr) == 0:
+            return np.zeros((0, 3), dtype=np.float32)
+        if arr.shape[1] == 2:
+            arr = np.pad(arr, ((0, 0), (0, 1)))
+        return arr[:, :3].astype(np.float32, copy=False)
+
+    def _normalize(vec):
+        vec = np.asarray(vec, dtype=np.float32).reshape(-1)
+        if len(vec) < 2:
+            return None
+        vec2 = vec[:2]
+        norm = np.linalg.norm(vec2)
+        if norm < 1e-6:
+            return None
+        return vec2 / norm
+
+    points = _stack_points(pcd)
+    if len(points) < 4:
+        base = _normalize(dirc)
+        if base is not None:
+            return base
+        return np.array([0.0, 1.0], dtype=np.float32)
+
+    xy = points[:, :2]
+    radius = np.linalg.norm(xy, axis=1)
+    if not np.isfinite(radius).all():
+        valid = np.isfinite(radius)
+        xy = xy[valid]
+        radius = radius[valid]
+    if len(xy) < 4:
+        base = _normalize(dirc)
+        if base is not None:
+            return base
+        return np.array([0.0, 1.0], dtype=np.float32)
+
+    inner_thresh = np.percentile(radius, 35.0)
+    outer_thresh = np.percentile(radius, 65.0)
+    inner_xy = xy[radius <= inner_thresh]
+    outer_xy = xy[radius >= outer_thresh]
+    if len(inner_xy) == 0 or len(outer_xy) == 0:
+        split = np.median(radius)
+        inner_xy = xy[radius <= split]
+        outer_xy = xy[radius > split]
+    if len(inner_xy) == 0 or len(outer_xy) == 0:
+        base = _normalize(dirc)
+        if base is not None:
+            return base
+        return np.array([0.0, 1.0], dtype=np.float32)
+
+    inner_center = inner_xy.mean(axis=0)
+    outer_center = outer_xy.mean(axis=0)
+    direction = _normalize(outer_center - inner_center)
+    if direction is None:
+        base = _normalize(dirc)
+        if base is not None:
+            return base
+        return np.array([0.0, 1.0], dtype=np.float32)
+
+    last_points = _stack_points(pcd_last)
+    history = _normalize(dirc)
+    if history is None and len(last_points) >= 4:
+        last_xy = last_points[:, :2]
+        last_radius = np.linalg.norm(last_xy, axis=1)
+        inner_last = last_xy[last_radius <= np.percentile(last_radius, 35.0)]
+        outer_last = last_xy[last_radius >= np.percentile(last_radius, 65.0)]
+        if len(inner_last) != 0 and len(outer_last) != 0:
+            history = _normalize(outer_last.mean(axis=0) - inner_last.mean(axis=0))
+
+    if history is not None and np.dot(direction, history) < 0:
+        direction = -direction
+
+    return direction.astype(np.float32, copy=False)
+
+def keep_largest_road_cluster(roads, eps=1, min_samples=20):
+    roads = np.asarray(roads, dtype=np.float32)
+    if roads.ndim != 2 or roads.shape[1] < 3 or len(roads) == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    if len(roads) < min_samples:
+        return roads[:, :3].astype(np.float32, copy=False)
+
+    labels = DBSCAN(eps=eps, min_samples=min_samples, n_jobs=24).fit_predict(roads[:, :3])
+    valid = labels >= 0
+    if not np.any(valid):
+        return roads[:, :3].astype(np.float32, copy=False)
+
+    cluster_ids, counts = np.unique(labels[valid], return_counts=True)
+    largest_label = cluster_ids[np.argmax(counts)]
+    return roads[labels == largest_label, :3].astype(np.float32, copy=False)
+
+
+def road_outline_by_alphashape(roads, alpha=0.8):
+      roads = np.asarray(roads, dtype=np.float32)
+      if len(roads) < 4:
+          return np.zeros((0, 2), dtype=np.float32)
+
+      points_xy = roads[:, :2]
+      shape = alphashape.alphashape(points_xy, alpha)
+
+      if shape is None or shape.is_empty:
+          return np.zeros((0, 2), dtype=np.float32)
+
+      if isinstance(shape, MultiPolygon):
+          shape = max(shape.geoms, key=lambda g: g.area)
+
+      if isinstance(shape, Polygon):
+          contour = np.asarray(shape.exterior.coords, dtype=np.float32)
+          return contour
+
+      if isinstance(shape, LineString):
+          return np.asarray(shape.coords, dtype=np.float32)
+
+      return np.zeros((0, 2), dtype=np.float32)
+
+
+def simplify_polyline_by_slope(polyline_xy, angle_thresh_deg=12.0, min_seg_length=0.15):
+    polyline_xy = np.asarray(polyline_xy, dtype=np.float32)
+    if len(polyline_xy) < 3:
+        return polyline_xy
+
+    is_closed = np.linalg.norm(polyline_xy[0] - polyline_xy[-1]) < 1e-6
+    work = polyline_xy[:-1].copy() if is_closed else polyline_xy.copy()
+    if len(work) < 3:
+        return polyline_xy
+
+    def _unit(vec):
+        norm = float(np.linalg.norm(vec))
+        if norm < 1e-6:
+            return None
+        return vec / norm
+
+    cos_thresh = float(np.cos(np.deg2rad(angle_thresh_deg)))
+    simplified = [work[0]]
+    prev_dir = None
+
+    for i in range(1, len(work)): 
+        vec = work[i] - simplified[-1] 
+        seg_len = float(np.linalg.norm(vec)) 
+        if seg_len < min_seg_length: 
+            continue
+        curr_dir = _unit(vec) 
+        if curr_dir is None: 
+            continue
+        if prev_dir is None: 
+            simplified.append(work[i]) 
+            prev_dir = curr_dir 
+            continue
+        if abs(float(np.dot(prev_dir, curr_dir))) >= cos_thresh: 
+            simplified[-1] = work[i] 
+            prev_dir = _unit(simplified[-1] - simplified[-2]) if len(simplified) >= 2 else curr_dir 
+        else: 
+            simplified.append(work[i]) 
+            prev_dir = _unit(simplified[-1] - simplified[-2])
+        
+    if len(simplified) == 1 or np.linalg.norm(simplified[-1] - work[-1]) >= min_seg_length: 
+        simplified.append(work[-1])
+    simplified = np.asarray(simplified, dtype=np.float32)
+    if is_closed: 
+        if len(simplified) >= 3: 
+            first_dir = _unit(simplified[1] - simplified[0]) 
+            last_dir = _unit(simplified[-1] - simplified[-2]) 
+            if first_dir is not None and last_dir is not None and abs(float(np.dot(first_dir, last_dir))) >= cos_thresh:
+                simplified[0] = simplified[-1] 
+                simplified = simplified[:-1]
+        simplified = np.vstack((simplified, simplified[:1])) 
+    
+    return simplified.astype(np.float32, copy=False)
+
+
+def _collect_lines_from_geometry(geom):
+    if geom is None or geom.is_empty:
+        return []
+    if isinstance(geom, LineString):
+        return [geom]
+    if isinstance(geom, MultiLineString):
+        return [g for g in geom.geoms if not g.is_empty]
+    if isinstance(geom, GeometryCollection):
+        lines = []
+        for g in geom.geoms:
+            lines.extend(_collect_lines_from_geometry(g))
+        return lines
+    return []
+
+
+def polygon_centerline_and_mid_tangent(polyline_xy, ref_dir=None, slice_step=0.2, min_width=0.3):
+    polyline_xy = np.asarray(polyline_xy, dtype=np.float32)
+    empty = {
+        'polygon': None,
+        'centerline': np.zeros((0, 2), dtype=np.float32),
+        'midpoint': None,
+        'dirc': None,
+    }
+    if polyline_xy.ndim != 2 or polyline_xy.shape[1] < 2 or len(polyline_xy) < 4:
+        return empty
+
+    ring = polyline_xy[:, :2]
+    if np.linalg.norm(ring[0] - ring[-1]) > 1e-6:
+        ring = np.vstack((ring, ring[:1]))
+
+    polygon = Polygon(ring)
+    if polygon.is_empty or not polygon.is_valid or polygon.area < 1e-4:
+        return empty
+
+    axis = find_max_extent_direction(ring, ref_dir=ref_dir)
+    axis_norm = float(np.linalg.norm(axis))
+    if axis_norm < 1e-6:
+        return empty
+    axis = axis / axis_norm
+    lateral = np.array([-axis[1], axis[0]], dtype=np.float32)
+
+    coords = np.asarray(polygon.exterior.coords, dtype=np.float32)[:, :2]
+    axis_vals = coords @ axis
+    lateral_vals = coords @ lateral
+    s_min = float(axis_vals.min())
+    s_max = float(axis_vals.max())
+    t_span = float(lateral_vals.max() - lateral_vals.min())
+    if s_max - s_min < slice_step or t_span < min_width:
+        return empty
+
+    half_extent = max(t_span, slice_step) + 2.0
+    centers = []
+    s_values = np.arange(s_min, s_max + slice_step * 0.5, slice_step, dtype=np.float32)
+    for s in s_values:
+        p0 = axis * s - lateral * half_extent
+        p1 = axis * s + lateral * half_extent
+        cross_line = LineString([tuple(p0), tuple(p1)])
+        inter = polygon.intersection(cross_line)
+        segments = _collect_lines_from_geometry(inter)
+        if not segments:
+            continue
+        seg = max(segments, key=lambda g: g.length)
+        if seg.length < min_width:
+            continue
+        seg_coords = np.asarray(seg.coords, dtype=np.float32)
+        midpoint = (seg_coords[0, :2] + seg_coords[-1, :2]) * 0.5
+        centers.append(midpoint)
+
+    if len(centers) < 2:
+        return empty
+
+    centerline = np.asarray(centers, dtype=np.float32)
+    axis_proj = centerline @ axis
+    centerline = centerline[np.argsort(axis_proj)]
+
+    keep = [centerline[0]]
+    for pt in centerline[1:]:
+        if float(np.linalg.norm(pt - keep[-1])) >= max(slice_step * 0.5, 1e-3):
+            keep.append(pt)
+    centerline = np.asarray(keep, dtype=np.float32)
+    if len(centerline) < 2:
+        return empty
+
+    mid_idx = len(centerline) // 2
+    if len(centerline) >= 3:
+        if mid_idx == 0:
+            tangent = centerline[1] - centerline[0]
+        elif mid_idx == len(centerline) - 1:
+            tangent = centerline[-1] - centerline[-2]
+        else:
+            tangent = centerline[mid_idx + 1] - centerline[mid_idx - 1]
     else:
-        z = np.zeros(len(rows), dtype=np.float32)
+        tangent = centerline[-1] - centerline[0]
+    tangent_norm = float(np.linalg.norm(tangent))
+    if tangent_norm < 1e-6:
+        tangent = axis.copy()
+    else:
+        tangent = tangent / tangent_norm
 
-    return np.stack((x, y, z), axis=1)
+    if ref_dir is not None:
+        ref = np.asarray(ref_dir, dtype=np.float32).reshape(-1)
+        if len(ref) >= 2:
+            ref = ref[:2]
+            ref_norm = float(np.linalg.norm(ref))
+            if ref_norm > 1e-6:
+                ref = ref / ref_norm
+                if float(np.dot(tangent, ref)) < 0:
+                    tangent = -tangent
+
+    return {
+        'polygon': polygon,
+        'centerline': centerline.astype(np.float32, copy=False),
+        'midpoint': centerline[mid_idx].astype(np.float32, copy=False),
+        'dirc': tangent.astype(np.float32, copy=False),
+    }
+
+
+def render_road_debug_image(polyline_xy, centerline_xy=None, midpoint=None, dirc=None, left_edge_xy=None, right_edge_xy=None, image_size=900, margin=40):
+    canvas = np.full((image_size, image_size, 3), 255, dtype=np.uint8)
+    items = []
+    for arr in (polyline_xy, centerline_xy, left_edge_xy, right_edge_xy):
+        if arr is None:
+            continue
+        arr = np.asarray(arr, dtype=np.float32)
+        if arr.ndim == 2 and arr.shape[1] >= 2 and len(arr) != 0:
+            items.append(arr[:, :2])
+    if midpoint is not None:
+        midpoint = np.asarray(midpoint, dtype=np.float32).reshape(-1)
+        if len(midpoint) >= 2:
+            items.append(midpoint[:2][None, :])
+    if not items:
+        return canvas
+
+    pts = np.vstack(items)
+    min_xy = pts.min(axis=0)
+    max_xy = pts.max(axis=0)
+    span = np.maximum(max_xy - min_xy, 1e-3)
+    scale = float((image_size - 2 * margin) / max(span[0], span[1]))
+
+    def _to_px(arr):
+        arr = np.asarray(arr, dtype=np.float32).reshape(-1, 2)
+        px = (arr - min_xy) * scale + margin
+        px[:, 1] = image_size - px[:, 1]
+        return np.rint(px).astype(np.int32)
+
+    poly_px = _to_px(polyline_xy[:, :2])
+    if len(poly_px) >= 2:
+        cv2.polylines(canvas, [poly_px.reshape(-1, 1, 2)], True, (0, 160, 0), 2, cv2.LINE_AA)
+
+    if centerline_xy is not None:
+        center_px = _to_px(np.asarray(centerline_xy, dtype=np.float32)[:, :2])
+        if len(center_px) >= 2:
+            cv2.polylines(canvas, [center_px.reshape(-1, 1, 2)], False, (255, 0, 0), 2, cv2.LINE_AA)
+
+    if left_edge_xy is not None:
+        left_px = _to_px(np.asarray(left_edge_xy, dtype=np.float32)[:, :2])
+        if len(left_px) >= 2:
+            cv2.polylines(canvas, [left_px.reshape(-1, 1, 2)], False, (0, 200, 255), 2, cv2.LINE_AA)
+
+    if right_edge_xy is not None:
+        right_px = _to_px(np.asarray(right_edge_xy, dtype=np.float32)[:, :2])
+        if len(right_px) >= 2:
+            cv2.polylines(canvas, [right_px.reshape(-1, 1, 2)], False, (255, 200, 0), 2, cv2.LINE_AA)
+
+    if midpoint is not None:
+        mid_px = _to_px(np.asarray(midpoint, dtype=np.float32)[:2][None, :])[0]
+        cv2.circle(canvas, tuple(mid_px), 5, (0, 0, 255), -1, cv2.LINE_AA)
+        if dirc is not None:
+            dir_vec = np.asarray(dirc, dtype=np.float32).reshape(-1)
+            if len(dir_vec) >= 2:
+                dir_vec = dir_vec[:2]
+                dir_norm = float(np.linalg.norm(dir_vec))
+                if dir_norm > 1e-6:
+                    dir_vec = dir_vec / dir_norm
+                    arrow_len = max(50, int(image_size * 0.12))
+                    end_px = np.rint(mid_px + np.array([dir_vec[0], -dir_vec[1]]) * arrow_len).astype(np.int32)
+                    cv2.arrowedLine(canvas, tuple(mid_px), tuple(end_px), (0, 0, 255), 3, cv2.LINE_AA, tipLength=0.2)
+
+    return canvas
+
+
+def extract_road_edges_by_slices(points_xy, dirc, slice_step=0.2, min_points_per_slice=10, side_percentile=20.0):
+    points_xy = np.asarray(points_xy, dtype=np.float32)
+    dirc = np.asarray(dirc, dtype=np.float32).reshape(-1)
+    empty = {
+        "left": np.zeros((0, 2), dtype=np.float32),
+        "right": np.zeros((0, 2), dtype=np.float32),
+        "corners": np.zeros((0, 2), dtype=np.float32),
+    }
+    if points_xy.ndim != 2 or points_xy.shape[1] < 2 or len(points_xy) < 2 or len(dirc) < 2:
+        return empty
+
+    forward = dirc[:2].astype(np.float32, copy=False)
+    norm = np.linalg.norm(forward)
+    if norm < 1e-6:
+        return empty
+    forward = forward / norm
+    lateral = np.array([-forward[1], forward[0]], dtype=np.float32)
+
+    s_vals = points_xy @ forward
+    t_vals = points_xy @ lateral
+    s_min = float(s_vals.min())
+    s_max = float(s_vals.max())
+    if s_max - s_min < slice_step:
+        return empty
+
+    left_pts = []
+    right_pts = []
+    bins = np.arange(s_min, s_max + slice_step, slice_step, dtype=np.float32)
+    for start in bins[:-1]:
+        end = start + slice_step
+        mask = (s_vals >= start) & (s_vals < end)
+        if np.count_nonzero(mask) < min_points_per_slice:
+            continue
+        s_mid = float((start + end) * 0.5)
+        slice_t = t_vals[mask]
+        left_t = float(np.percentile(slice_t, side_percentile))
+        right_t = float(np.percentile(slice_t, 100.0 - side_percentile))
+        left_pts.append(forward * s_mid + lateral * left_t)
+        right_pts.append(forward * s_mid + lateral * right_t)
+
+    if len(left_pts) < 2 or len(right_pts) < 2:
+        return empty
+
+    left = np.asarray(left_pts, dtype=np.float32)
+    right = np.asarray(right_pts, dtype=np.float32)
+    corners = np.asarray([left[0], left[-1], right[0], right[-1]], dtype=np.float32)
+    return {"left": left, "right": right, "corners": corners}
+
+
+def find_parallel_segments_near_axis(polyline_xy, axis_dir, min_seg_length=0.5, axis_angle_thresh_deg=20.0, pair_angle_thresh_deg=10.0, min_lateral_gap=0.5):
+    polyline_xy = np.asarray(polyline_xy, dtype=np.float32)
+    axis_dir = np.asarray(axis_dir, dtype=np.float32).reshape(-1)
+    if len(polyline_xy) < 2 or len(axis_dir) < 2:
+        return []
+
+    axis = axis_dir[:2]
+    axis_norm = float(np.linalg.norm(axis))
+    if axis_norm < 1e-6:
+        return []
+    axis = axis / axis_norm
+    lateral = np.array([-axis[1], axis[0]], dtype=np.float32)
+    cos_axis = float(np.cos(np.deg2rad(axis_angle_thresh_deg)))
+    cos_pair = float(np.cos(np.deg2rad(pair_angle_thresh_deg)))
+
+    segments = []
+    num_edges = len(polyline_xy) - 1
+    for i in range(num_edges):
+        p1 = polyline_xy[i]
+        p2 = polyline_xy[i + 1]
+        vec = p2 - p1
+        seg_len = float(np.linalg.norm(vec))
+        if seg_len < min_seg_length:
+            continue
+        seg_dir = vec / seg_len
+        if abs(float(np.dot(seg_dir, axis))) < cos_axis:
+            continue
+        if float(np.dot(seg_dir, axis)) < 0:
+            seg_dir = -seg_dir
+            p1, p2 = p2, p1
+        midpoint = (p1 + p2) * 0.5
+        lat = float(np.dot(midpoint, lateral))
+        axis_pos = float(np.dot(midpoint, axis))
+        segments.append({
+            'p1': p1.astype(np.float32, copy=False),
+            'p2': p2.astype(np.float32, copy=False),
+            'dir': seg_dir.astype(np.float32, copy=False),
+            'length': seg_len,
+            'lat': lat,
+            'axis_pos': axis_pos,
+        })
+
+    if len(segments) < 2:
+        return []
+
+    best_pair = None
+    best_score = -1e9
+    for i in range(len(segments)):
+        for j in range(i + 1, len(segments)):
+            s1 = segments[i]
+            s2 = segments[j]
+            if abs(float(np.dot(s1['dir'], s2['dir']))) < cos_pair:
+                continue
+            lateral_gap = abs(s1['lat'] - s2['lat'])
+            if lateral_gap < min_lateral_gap:
+                continue
+            axis_overlap = -abs(s1['axis_pos'] - s2['axis_pos'])
+            score = s1['length'] + s2['length'] + 0.5 * lateral_gap + 0.2 * axis_overlap
+            if score > best_score:
+                best_score = score
+                best_pair = [s1, s2]
+
+    if best_pair is None:
+        return []
+    best_pair.sort(key=lambda s: s['lat'])
+    return best_pair
+
+
+def find_max_extent_direction(polyline_xy, ref_dir=None, angle_step_deg=1.0):
+    polyline_xy = np.asarray(polyline_xy, dtype=np.float32)
+    if polyline_xy.ndim != 2 or polyline_xy.shape[1] < 2 or len(polyline_xy) < 2:
+        return np.array([0.0, 1.0], dtype=np.float32)
+
+    pts = polyline_xy[:, :2]
+    best_dir = None
+    best_span = -1.0
+    for theta_deg in np.arange(0.0, 180.0, angle_step_deg, dtype=np.float32):
+        theta = np.deg2rad(theta_deg)
+        cand = np.array([np.cos(theta), np.sin(theta)], dtype=np.float32)
+        proj = pts @ cand
+        span = float(proj.max() - proj.min())
+        if span > best_span:
+            best_span = span
+            best_dir = cand
+
+    if best_dir is None:
+        return np.array([0.0, 1.0], dtype=np.float32)
+
+    if ref_dir is not None:
+        ref = np.asarray(ref_dir, dtype=np.float32).reshape(-1)
+        if len(ref) >= 2:
+            ref = ref[:2]
+            ref_norm = float(np.linalg.norm(ref))
+            if ref_norm > 1e-6:
+                ref = ref / ref_norm
+                if float(np.dot(best_dir, ref)) < 0:
+                    best_dir = -best_dir
+
+    return best_dir.astype(np.float32, copy=False)
+
 
 def process():
     global sempcd
@@ -580,9 +1130,12 @@ def process():
     global br
     global last_points
     global vectors
+    global top_vectors
+    global bottom_vectors
     global lanepcd
     global roadpcd
-    global road_masks
+    global last_roads_cluster
+    global last_road_dirc
 
     if args.trajectory:
         p = poses[index]
@@ -590,41 +1143,57 @@ def process():
         br.sendTransform((p[0], p[1], p[2]), rotation, rospy.Time(time.time()), 'odom', 'world')
         if args.vector:
             roads = sempcd[sempcd[:, 3] == config['road_class']]
-            roadpcd.append(roads)
-            if len(roadpcd) >= window_road:
-                roads = np.vstack(roadpcd)
-                bev_data = pointcloud_to_bev(roads, resolution=0.2, padding=5)
-                bev_img = bev_data['bev'].astype(np.uint8) * 255
-                cv2.imwrite("bev_img.png", bev_img)
-                bev_img = morph_open(bev_img, kernel_size=1, iterations=1)
-                bev_img = morph_close(bev_img, kernel_size=5, iterations=1)
-                bev_img = flood_fill_holes(bev_img)
-                road_mask = keep_largest_connected_component(bev_img)
-                cv2.imwrite("mask.png", road_mask)
-                road_mask_rotate = rotate_mask_to_major_axis(road_mask)
-                cv2.imwrite("mask_rotate.png", road_mask_rotate["mask"])
-                mask_skeletonize = skeletonize_mask(road_mask_rotate["mask"])
-                cv2.imwrite("mask_skeletonize.png", mask_skeletonize)
-                mask_line = find_longest_top_bottom_edges(road_mask_rotate["mask"])
-                cv2.imwrite("mask_line.png",mask_line["line_mask"])
-                
+            if len(roadpcd) < window_road:
+                roadpcd.append(roads)
+            else:
+                roadpcd.append(roads)
+                if index % step == 0:
+                    roads = np.vstack(roadpcd)
+                    roads = pcd_trans(roads, p, rotation, True)
+                    roads = roads[(roads[:, 1] > 3) & (roads[:, 1] < 10)]
 
+                    roads_cluster = keep_largest_road_cluster(roads[:, :3], eps=1, min_samples=20)
+                    print('road cluster:', len(roads_cluster), '/', len(roads))
+                    contour_xy = road_outline_by_alphashape(roads_cluster, alpha=0.8)
+                    contour_xy = simplify_polyline_by_slope(contour_xy, angle_thresh_deg=15.0, min_seg_length=0.15)
+                    if len(contour_xy) >= 4:
+                        center_info = polygon_centerline_and_mid_tangent(
+                            contour_xy,
+                            ref_dir=last_road_dirc,
+                            slice_step=0.2,
+                            min_width=0.3,
+                        )
+                        dirc = center_info['dirc']
+                        edge_info = {
+                            'left': np.zeros((0, 2), dtype=np.float32),
+                            'right': np.zeros((0, 2), dtype=np.float32),
+                        }
+                        if dirc is not None:
+                            last_road_dirc = dirc
+                            print('dirc:', dirc)
+                            seg_pair = find_parallel_segments_near_axis(
+                                contour_xy,
+                                dirc,
+                                min_seg_length=0.5,
+                                axis_angle_thresh_deg=20.0,
+                                pair_angle_thresh_deg=10.0,
+                                min_lateral_gap=0.5,
+                            )
+                            if len(seg_pair) == 2:
+                                edge_info['left'] = np.vstack((seg_pair[0]['p1'], seg_pair[0]['p2'])).astype(np.float32, copy=False)
+                                edge_info['right'] = np.vstack((seg_pair[1]['p1'], seg_pair[1]['p2'])).astype(np.float32, copy=False)
+                            print('road edges:', len(edge_info['left']), len(edge_info['right']))
+                        debug_img = render_road_debug_image(
+                            contour_xy,
+                            centerline_xy=center_info['centerline'],
+                            midpoint=center_info['midpoint'],
+                            dirc=dirc,
+                            left_edge_xy=edge_info['left'],
+                            right_edge_xy=edge_info['right'],
+                        )
+                        cv2.imwrite(config['save_folder'] + '/road_debug.png', debug_img)
+                    print(contour_xy)
 
-                sys.exit()
-                road_masks.append({
-                    "pose": p,
-                    "bev": bev_data,
-                    "mask": road_mask
-                })
-
-
-                index += 1
-                sys.exit()
-                if len(road_masks) >= window:
-                    print("len road_mask full")
-                    sys.exit()
-                else:
-                    return
 
 
     if args.filters:
@@ -639,6 +1208,9 @@ def process():
         semimgPubHandle.publish(bri.cv2_to_imgmsg(semimg, 'bgr8'))
     if args.origin and index < len(imgs):
         imgPubHandle.publish(bri.cv2_to_imgmsg(cv2.imread(imgs[index]), 'bgr8'))
+
+    if args.trajectory:
+        index += 1
 
 
 # parse arguments
@@ -682,16 +1254,21 @@ imgPubHandle = rospy.Publisher('Img',Image,queue_size = 5)
 color_classes = get_colors(config['cmap'])
 savepcd = []
 vectors = []
+top_vectors = []
+bottom_vectors = []
 bri = CvBridge()
 index = 0
 br = tf.TransformBroadcaster()
-dbs = DBSCAN(eps = 1,min_samples=5,n_jobs=24)
+dbs = DBSCAN(eps = 0.3,min_samples=10,n_jobs=24)
 pole_dbs = DBSCAN(eps = 0.3,min_samples=50,n_jobs=24)
-#dbs = DBSCAN()
 last_points = myqueue(1)
 lanepcd = myqueue(window)
 polepcd = myqueue(window)
 roadpcd = myqueue(window_road)
+
+last_roads_cluster = None
+last_road_dirc = None
+
 pairs_all = []
 vec_world = []
 
@@ -720,14 +1297,19 @@ if args.mode == 'indoor':
     savepcd = np.concatenate(sempcds)
 elif args.mode == 'outdoor':
     try:
-        while True:
+        while index < 50:
             sempcd = pickle.load(args.input)
             savepcd.append(sempcd)
             process()
-            #print(index)
+            print(index)
     except EOFError:
         print('done')
+
+if isinstance(savepcd, list):
+    if len(savepcd) != 0:
         savepcd = np.concatenate(savepcd)
+    else:
+        savepcd = np.zeros((0, 4), dtype=np.float32)
 
 if args.vector:
     poles = savepcd[np.in1d(savepcd[:, 3], [config['pole_class']])]
@@ -744,14 +1326,21 @@ if args.vector:
 
 if args.save is not None:
     save_nppc(savepcd,args.save)
+    save_dir = '/'.join(args.save.split('/')[:-1])
     vector_parts = []
     if len(vectors) != 0:
-        vector_parts.append(np.vstack(vectors))
+        all_vectors = np.vstack(vectors)
+        vector_parts.append(all_vectors)
+        save_nppc(all_vectors, save_dir + '/vector_points.pcd')
+    if len(top_vectors) != 0:
+        save_nppc(np.vstack(top_vectors), save_dir + '/vector_top_points.pcd')
+    if len(bottom_vectors) != 0:
+        save_nppc(np.vstack(bottom_vectors), save_dir + '/vector_bottom_points.pcd')
     if args.vector and len(poles) != 0:
         vector_parts.append(np.vstack(poles))
     if len(vector_parts) != 0:
         v = np.vstack(vector_parts)
-        save_nppc(v,'/'.join(args.save.split('/')[:-1])+'/vector.pcd')
+        save_nppc(v, save_dir + '/vector.pcd')
 
 
 
