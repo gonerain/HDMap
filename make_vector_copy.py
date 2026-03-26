@@ -383,32 +383,11 @@ def process():
 
             dirc = dircpcd["last"]["centerpoint"] - dircpcd["front"]["centerpoint"]
             dirc_norm = float(np.linalg.norm(dirc))
-            if dirc_norm < 1e-6:
-                print('skip: invalid centerpoint dirc')
-                index += 1
-                return
-            dirc = (dirc / dirc_norm).astype(np.float32, copy=False)
-            seg_pair = find_parallel_segments_around_center(
-                contour_xy,
-                current_center,
-                dirc,
-                min_seg_length=0.5,
-                dir_angle_thresh_deg=15.0,
-                pair_angle_thresh_deg=10.0,
-                min_lateral_gap=0.5,
-            )
-            if len(seg_pair) != 2:
-                print('skip: no parallel contour segments around centerpoint')
-                index += 1
-                return
-            left_seg, right_seg = seg_pair
 
             all_xy_parts = [
                 current_center[None, :],
                 dircpcd["front"]["centerpoint"][None, :],
                 dircpcd["last"]["centerpoint"][None, :],
-                np.vstack((left_seg['p1'], left_seg['p2'])),
-                np.vstack((right_seg['p1'], right_seg['p2'])),
             ]
             if len(roads_cluster) != 0:
                 all_xy_parts.append(roads_cluster[:, :2])
@@ -436,10 +415,6 @@ def process():
             if len(contour_xy) >= 2:
                 contour_canvas = to_canvas(contour_xy[:, :2]).reshape(-1, 1, 2)
                 cv2.polylines(canvas, [contour_canvas], True, (0, 80, 255), 3)
-            left_canvas = to_canvas(np.vstack((left_seg['p1'], left_seg['p2']))).reshape(-1, 1, 2)
-            right_canvas = to_canvas(np.vstack((right_seg['p1'], right_seg['p2']))).reshape(-1, 1, 2)
-            cv2.polylines(canvas, [left_canvas], False, (255, 80, 80), 5)
-            cv2.polylines(canvas, [right_canvas], False, (80, 220, 80), 5)
 
             current_pt = tuple(to_canvas(current_center[None, :])[0])
             front_pt = tuple(to_canvas(dircpcd["front"]["centerpoint"][None, :])[0])
@@ -450,9 +425,34 @@ def process():
             cv2.putText(canvas, "current centroid", (current_pt[0] + 12, current_pt[1] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (20, 20, 20), 2)
             cv2.putText(canvas, "front", (front_pt[0] + 12, front_pt[1] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 120, 220), 2)
             cv2.putText(canvas, "last", (last_pt[0] + 12, last_pt[1] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 140, 0), 2)
+
+            if dirc_norm < static_dirc_thresh:
+                cv2.imwrite(f"demo_output/road_centroid_debug_{index:06d}.png", canvas)
+                print(f'static skip @ {index}: dirc_norm={dirc_norm:.4f}, thresh={static_dirc_thresh:.4f}')
+                print(f'front={dircpcd["front"]["centerpoint"]}, last={dircpcd["last"]["centerpoint"]}, current={current_center}')
+                index += 1
+                return
+
+            dirc = (dirc / dirc_norm).astype(np.float32, copy=False)
+            seg_pair = find_parallel_segments_around_center(
+                contour_xy,
+                current_center,
+                dirc,
+                min_seg_length=0.5,
+                dir_angle_thresh_deg=15.0,
+                pair_angle_thresh_deg=10.0,
+                min_lateral_gap=0.5,
+            )
+            if len(seg_pair) != 2:
+                print('skip: no parallel contour segments around centerpoint')
+                index += 1
+                return
+            left_seg, right_seg = seg_pair
+            left_canvas = to_canvas(np.vstack((left_seg['p1'], left_seg['p2']))).reshape(-1, 1, 2)
+            right_canvas = to_canvas(np.vstack((right_seg['p1'], right_seg['p2']))).reshape(-1, 1, 2)
+            cv2.polylines(canvas, [left_canvas], False, (255, 80, 80), 5)
+            cv2.polylines(canvas, [right_canvas], False, (80, 220, 80), 5)
             cv2.imwrite(f"demo_output/road_centroid_debug_{index:06d}.png", canvas)
-            if index >= 30:
-                sys.exit(0)
 
             
     index += 1
@@ -483,6 +483,7 @@ parser.add_argument('-t','--trajectory',default=None,help='Trajectory file, use 
 parser.add_argument('--semantic',default=None,help='Semantic photos folder')
 parser.add_argument('--origin',default=None,help='Origin photos folder')
 parser.add_argument('--vector',default=None,help='Do the vectorization, only available when filters are accepted',action='store_true')
+parser.add_argument("--max_index", default=500, type=int, help="Max index to process, default to process all data")
 args = parser.parse_args()
 
 if args.config:
@@ -499,7 +500,7 @@ args.vector = (args.vector) or config['vector']
 # init variables
 
 window = 10
-step = 1
+step = 50
 
 # start ros
 rospy.init_node('fix_distortion', anonymous=False, log_level=rospy.DEBUG)
@@ -525,8 +526,9 @@ pairs_all = []
 vec_world = []
 
 #road
-window_road = 10
-dirc_window = 20
+window_road = 20
+dirc_window = 25
+static_dirc_thresh = 0.1
 road_savedpcd=myqueue(2*dirc_window + window_road)
 
 index = dirc_window
@@ -569,34 +571,48 @@ if args.mode == 'indoor':
 elif args.mode == 'outdoor':
     try:
         while True:
+            if index >= args.max_index:
+                print('reach max index, stop processing')
+                break
             sempcd = pickle.load(args.input)
             road_savedpcd.append(sempcd[sempcd[:, 3] == config['road_class']])
             if road_savedpcd.is_full() != True:
                 continue
+            if index % step != 0:
+                index += 1
+                continue
             process()
-            #print(index)
+            print(index)
     except EOFError:
         print('done')
-        savepcd = np.concatenate(savepcd)
+    if isinstance(savepcd, list):
+        if len(savepcd) > 0:
+            savepcd = np.concatenate(savepcd)
+        else:
+            savepcd = np.zeros((0, 4), dtype=np.float32)
 
 if args.vector:
-    poles = savepcd[np.in1d(savepcd[:, 3], [config['pole_class']])]
-    poles = poles[poles[:,2]>-2]
-    poles = poles[poles[:,2]<8]
-    pole_centers = get_pole_centers(poles[:, :3])
-    poles = []
-    for pole in pole_centers:
-        poles.append(draw_line(pole,np.array([pole[0],pole[1],-2.3])))
-    polemsg = get_rgba_pcd_msg(np.vstack(poles),color2int32((255,0,255,0)))
-    vecPubHandle.publish(polemsg)
+    if len(savepcd) != 0:
+        poles = savepcd[np.in1d(savepcd[:, 3], [config['pole_class']])]
+        poles = poles[poles[:,2]>-2]
+        poles = poles[poles[:,2]<8]
+        pole_centers = get_pole_centers(poles[:, :3])
+        poles = []
+        for pole in pole_centers:
+            poles.append(draw_line(pole,np.array([pole[0],pole[1],-2.3])))
+        if len(poles) != 0:
+            polemsg = get_rgba_pcd_msg(np.vstack(poles),color2int32((255,0,255,0)))
+            vecPubHandle.publish(polemsg)
 
 
 if args.save is not None:
-    save_nppc(savepcd,args.save)
-    lane = np.vstack(vectors)
-    p = np.vstack(poles)
-    v = np.vstack((lane,p))
-    save_nppc(v,'/'.join(args.save.split('/')[:-1])+'/vector.pcd')
+    if len(savepcd) != 0:
+        save_nppc(savepcd,args.save)
+    if len(vectors) != 0 and 'poles' in locals() and len(poles) != 0:
+        lane = np.vstack(vectors)
+        p = np.vstack(poles)
+        v = np.vstack((lane,p))
+        save_nppc(v,'/'.join(args.save.split('/')[:-1])+'/vector.pcd')
 
 
 
