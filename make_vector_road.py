@@ -306,6 +306,24 @@ def save_debug_canvas(index, canvas):
     cv2.imwrite(f'demo_output/road_centroid_debug_{index:06d}.png', canvas)
 
 
+def make_road_edge_record(index, road_ctx, left_seg, right_seg, dirc, road_z):
+    # Store the minimal per-frame geometry needed for later edge merging.
+    return {
+        'index': int(index),
+        'centroid': road_ctx['current_center'].astype(np.float32).tolist(),
+        'dirc': np.asarray(dirc, dtype=np.float32).tolist(),
+        'road_z': float(road_z),
+        'left_edge': {
+            'p1': left_seg['p1'].astype(np.float32).tolist(),
+            'p2': left_seg['p2'].astype(np.float32).tolist(),
+        },
+        'right_edge': {
+            'p1': right_seg['p1'].astype(np.float32).tolist(),
+            'p2': right_seg['p2'].astype(np.float32).tolist(),
+        },
+    }
+
+
 def process_road_vectorization(index):
     # Main road-only vectorization path for the current sampled frame.
     if args.mode != 'outdoor' or not road_savedpcd.is_full():
@@ -316,7 +334,7 @@ def process_road_vectorization(index):
     print('road cluster:', len(roads_cluster), '/', len(road_ctx['current_points']))
 
     contour_xy = road_outline_by_alphashape(roads_cluster, alpha=0.8)
-    contour_xy = simplify_polyline_by_slope(contour_xy, angle_thresh_deg=15.0, min_seg_length=0.15)
+    contour_xy = simplify_polyline_by_slope(contour_xy, angle_thresh_deg=7.0, min_seg_length=0.15)
 
     dirc = road_ctx['last']['centerpoint'] - road_ctx['front']['centerpoint']
     dirc_norm = float(np.linalg.norm(dirc))
@@ -351,6 +369,8 @@ def process_road_vectorization(index):
     right_canvas = to_canvas(np.vstack((right_seg['p1'], right_seg['p2']))).reshape(-1, 1, 2)
     cv2.polylines(canvas, [left_canvas], False, (255, 80, 80), 5)
     cv2.polylines(canvas, [right_canvas], False, (80, 220, 80), 5)
+    road_z = float(np.median(road_ctx['current_points'][:, 2])) if len(road_ctx['current_points']) != 0 else 0.0
+    road_edge_records.append(make_road_edge_record(index, road_ctx, left_seg, right_seg, dirc / dirc_norm, road_z))
     save_debug_canvas(index, canvas)
     return True
 
@@ -397,8 +417,9 @@ parser.add_argument('-s', '--save', default=None, help='Save to pcd file')
 parser.add_argument('-t', '--trajectory', default=None, help='Trajectory file, use to follow the camera')
 parser.add_argument('--semantic', default=None, help='Semantic photos folder')
 parser.add_argument('--origin', default=None, help='Origin photos folder')
-parser.add_argument('--vector', default=None, help='Do the vectorization, only available when filters are accepted', action='store_true')
-parser.add_argument('--max_index', default=500, type=int, help='Max index to process, default to process all data')
+parser.add_argument('--vector', default="result/outdoor/road_edge_records.json", help='Do the vectorization, only available when filters are accepted', action='store_true')
+parser.add_argument('--max_index', default=200, type=int, help='Max index to process, default to process all data')
+parser.add_argument('--start_index', default=10000, type=int, help='Start processing from this frame index')
 args = parser.parse_args()
 
 if args.config:
@@ -413,12 +434,17 @@ args.semantic = args.semantic or config['save_folder'] + '/sempics'
 args.origin = args.origin or config['save_folder'] + '/originpics'
 args.vector = args.vector or config['vector']
 
-step = 50
-window_road = 20
-dirc_window = 25
+step = 20
+window_road = 10
+dirc_window = 20
 static_dirc_thresh = 0.2
 road_savedpcd = MyQueue(2 * dirc_window + window_road)
 index = dirc_window
+start_index = args.start_index if args.start_index is not None else dirc_window
+start_index = max(start_index, dirc_window)
+index = start_index
+warmup_skip = max(0, start_index - dirc_window)
+skipped = 0
 
 rospy.init_node('fix_distortion', anonymous=False, log_level=rospy.DEBUG)
 semantic_cloud_pub = rospy.Publisher('SemanticCloud', PointCloud2, queue_size=5)
@@ -447,6 +473,8 @@ else:
     poses = None
 
 savepcd = []
+road_edge_records = []
+road_edge_record_path = 'road_edge_records.json'
 if args.mode == 'indoor':
     sempcds = pickle.load(args.input)
     for sempcd in sempcds:
@@ -454,6 +482,9 @@ if args.mode == 'indoor':
     savepcd = np.concatenate(sempcds) if len(sempcds) != 0 else np.zeros((0, 4), dtype=np.float32)
 elif args.mode == 'outdoor':
     try:
+        while skipped < warmup_skip:
+              pickle.load(args.input)
+              skipped += 1
         while True:
             if index >= args.max_index:
                 print('reach max index, stop processing')
@@ -470,6 +501,11 @@ elif args.mode == 'outdoor':
     except EOFError:
         print('done')
     savepcd = np.zeros((0, 4), dtype=np.float32)
+
+if args.vector:
+    with open(road_edge_record_path, 'w') as f:
+        json.dump(road_edge_records, f, indent=2)
+    print(f'saved road edge records to {road_edge_record_path} ({len(road_edge_records)} records)')
 
 if args.save is not None and len(savepcd) != 0:
     save_nppc(savepcd, args.save)
