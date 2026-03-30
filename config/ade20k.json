@@ -26,7 +26,9 @@
     "model_file":"imseg/mmseg/model/upernet_swin_large_patch4_window12_512x512_pretrain_384x384_22K_160k_ade20k_20220318_091743-9ba68901.pth",
     "lane_class":24,
     "pole_class":45,
+    "sidewalk_class":11,
     "vector":false,
+    "vector_process":"road",
     "predict_func":"get_predict_func_mmsegmentation",
     "cmap":"ade20k"
 }

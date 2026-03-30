@@ -28,7 +28,10 @@
     "lane_class":24,
     "pole_class":45,
     "road_class":13,
+    "sidewalk_class":15,
+    "crosswalk_class":23,
     "vector":true,
+    "vector_process":"road",
     "predict_func":"get_predict_func_detectron",
     "cmap":"mapillary"
 }

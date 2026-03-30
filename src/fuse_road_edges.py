@@ -155,6 +155,7 @@ def filter_samples(records, args):
         "side_rejected": 0,
         "width_rejected": 0,
         "centroid_rejected": 0,
+        "backtrack_rejected": 0,
         "side_flipped": False,
     }
 
@@ -230,9 +231,28 @@ def filter_samples(records, args):
                 continue
         filtered.append(sample)
 
+    filtered = filter_backtracking_samples(filtered, args, stats)
+
     stats["valid_records"] = len(filtered)
     stats["width_median"] = width_median
     return filtered, stats
+
+
+def filter_backtracking_samples(samples, args, stats):
+    if len(samples) <= 1 or args.max_backtrack <= 0.0:
+        return samples
+
+    kept = [samples[0]]
+    for sample in samples[1:]:
+        prev = kept[-1]
+        delta = sample["c"] - prev["c"]
+        ref_t = normalize_rows((prev["t"] + sample["t"])[None, :])[0]
+        forward = float(np.dot(delta, ref_t))
+        if forward < -float(args.max_backtrack):
+            stats["backtrack_rejected"] += 1
+            continue
+        kept.append(sample)
+    return kept
 
 
 def compute_station(samples):
@@ -273,14 +293,15 @@ def smooth_samples(samples, s_values, args):
     widths = np.asarray([sample["w"] for sample in samples], dtype=np.float32)
     road_z = np.asarray([sample["road_z"] for sample in samples], dtype=np.float32)
 
-    tangent_geom = estimate_center_tangents(center, tangent)
+    center_smooth = moving_average(center, args.center_window)
+    tangent_geom = estimate_center_tangents(center_smooth, tangent)
     tangent_smooth = normalize_rows(moving_average(tangent_geom, args.dir_window))
     width_smooth = moving_average(median_filter_1d(widths, args.width_window), args.width_window)
     road_z_smooth = moving_average(road_z, args.center_window)
 
     fused = []
     for idx, sample in enumerate(samples):
-        center_i = center[idx]
+        center_i = center_smooth[idx]
         tangent_i = tangent_smooth[idx]
         normal_i = np.array([-tangent_i[1], tangent_i[0]], dtype=np.float32)
         width_i = float(width_smooth[idx])
@@ -381,12 +402,14 @@ def build_output(records, args):
             "side_rejected": stats["side_rejected"],
             "width_rejected": stats["width_rejected"],
             "centroid_rejected": stats["centroid_rejected"],
+            "backtrack_rejected": stats["backtrack_rejected"],
             "side_flipped": stats["side_flipped"],
             "width_median": stats["width_median"],
             "params": {
                 "width_min": args.width_min,
                 "width_max": args.width_max,
                 "width_dev": args.width_dev,
+                "max_backtrack": args.max_backtrack,
                 "default_width": args.default_width,
                 "centroid_thresh": args.centroid_thresh,
                 "dir_window": args.dir_window,
@@ -409,6 +432,7 @@ def parse_args():
     parser.add_argument("--width-min", type=float, default=1.5, help="Minimum legal road width in meters")
     parser.add_argument("--width-max", type=float, default=20.0, help="Maximum legal road width in meters")
     parser.add_argument("--width-dev", type=float, default=0.0, help="Allowed deviation from local median width in meters, <=0 disables")
+    parser.add_argument("--max-backtrack", type=float, default=0.3, help="Reject samples that move backward along local tangent by more than this many meters")
     parser.add_argument("--default-width", type=float, default=4.0, help="Fallback width used to compensate missing sides")
     parser.add_argument("--centroid-thresh", type=float, default=0.0, help="Optional centroid-vs-pseudo-center threshold, 0 disables")
     parser.add_argument("--dir-window", type=int, default=9, help="Moving-average window for direction smoothing")

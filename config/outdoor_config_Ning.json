@@ -3,8 +3,8 @@
     "start_time":120,
     "play_time":5,
     "GNSS_topic":"/acc_pose",
-    "LiDAR_topic":"/origin_cloud",
-    "cloud_distortion":true,
+    "LiDAR_topic":"/dedistortion_cloud",
+    "cloud_distortion":false,
     "camera_topic":"/image",
     "image_compressed":true,
     "extrinsic":    
@@ -27,10 +27,14 @@
     "model_file":"imseg/mask2former/model/model.pkl",
     "lane_class":24,
     "pole_class":45,
+    "road_class":13,
     "sidewalk_class":15,
     "crosswalk_class":23,
-    "predict_func":"get_predict_func_detectron",
-    "vector":false,
+
+    "vector":true,
     "vector_process":"road",
+    "max_index":10000,
+    "start_index":20,
+    "predict_func":"get_predict_func_detectron",
     "cmap":"mapillary"
 }

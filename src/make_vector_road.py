@@ -3,7 +3,9 @@ import argparse
 import glob
 import json
 import pickle
+import sys
 import time
+from pathlib import Path
 
 import alphashape
 import cv2
@@ -13,10 +15,15 @@ import rospy
 import tf
 from cv_bridge import CvBridge
 from pclpy import pcl
-from predict import get_colors
 from sensor_msgs.msg import Image, PointCloud2
 from shapely.geometry import LineString, MultiPolygon, Polygon
 from sklearn.cluster import DBSCAN
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from predict import get_colors
 from util import get_rgba_pcd_msg
 
 
@@ -589,11 +596,16 @@ if args.config:
 
 args.input = args.input or open(config['save_folder'] + ('/indoor.pkl' if config['mode'] == 'indoor' else '/outdoor.pkl'), 'rb')
 args.mode = args.mode or config['mode']
+args.filters = args.filters or config.get('filters')
 args.trajectory = args.trajectory or config['save_folder'] + '/pose.csv'
 args.save = args.save or config['save_folder'] + '/result.pcd'
 args.semantic = args.semantic or config['save_folder'] + '/sempics'
 args.origin = args.origin or config['save_folder'] + '/originpics'
 args.vector = args.vector or config['vector']
+if args.max_index == parser.get_default('max_index'):
+    args.max_index = config.get('max_index', args.max_index)
+if args.start_index is None:
+    args.start_index = config.get('start_index')
 
 step = 2
 window_road = 10
