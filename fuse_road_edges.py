@@ -88,20 +88,32 @@ def parse_record(record):
         return None
 
     dirc = as_xy(record["dirc"])
-    t = normalize_rows(dirc[None, :])[0]
-    n = np.array([-t[1], t[0]], dtype=np.float32)
+    t_hint = normalize_rows(dirc[None, :])[0]
+    n_hint = np.array([-t_hint[1], t_hint[0]], dtype=np.float32)
     centroid = as_xy(record.get("centroid", [0.0, 0.0]))
     road_z = float(record.get("road_z", 0.0))
 
     if m_left is not None and m_right is not None:
         c = 0.5 * (m_left + m_right)
         w = float(np.linalg.norm(m_left - m_right))
+        # Prefer the left-right span to estimate the local road normal.
+        # This is more stable than using motion direction alone on sharp turns.
+        n = normalize_rows((m_left - m_right)[None, :])[0]
+        if float(np.dot(n, n_hint)) < 0.0:
+            n = -n
+        t = np.array([-n[1], n[0]], dtype=np.float32)
+        if float(np.dot(t, t_hint)) < 0.0:
+            t = -t
     elif m_left is not None:
         c = m_left.copy()
         w = np.nan
+        t = t_hint
+        n = n_hint
     else:
         c = m_right.copy()
         w = np.nan
+        t = t_hint
+        n = n_hint
 
     return {
         "index": int(record.get("index", -1)),
@@ -195,15 +207,20 @@ def filter_samples(records, args):
         stats["width_median"] = fallback_width
         return [], stats
 
+    legal = sorted(legal, key=lambda item: item["index"])
     widths = np.asarray([sample["w"] for sample in legal], dtype=np.float32)
     width_median = float(np.median(widths))
-    width_delta = np.abs(widths - width_median)
+    width_ref = median_filter_1d(widths, args.width_window)
+    width_delta = np.abs(widths - width_ref)
     width_dev_limit = max(float(args.width_dev), float(np.median(width_delta) * 3.0))
 
     filtered = []
-    for sample in legal:
+    for sample, width_ref_i in zip(legal, width_ref):
         width = float(sample["w"])
-        if width < args.width_min or width > args.width_max or abs(width - width_median) > width_dev_limit:
+        if width < args.width_min or width > args.width_max:
+            stats["width_rejected"] += 1
+            continue
+        if args.width_dev > 0.0 and abs(width - float(width_ref_i)) > width_dev_limit:
             stats["width_rejected"] += 1
             continue
         if args.centroid_thresh > 0.0:
@@ -224,40 +241,53 @@ def compute_station(samples):
         return ordered, np.zeros((0,), dtype=np.float32)
     s = np.zeros((len(ordered),), dtype=np.float32)
     for idx in range(1, len(ordered)):
-        delta_s = float(np.dot(ordered[idx]["c"] - ordered[idx - 1]["c"], ordered[idx - 1]["t"]))
-        s[idx] = s[idx - 1] + max(delta_s, 0.0)
+        delta_s = float(np.linalg.norm(ordered[idx]["c"] - ordered[idx - 1]["c"]))
+        s[idx] = s[idx - 1] + delta_s
     return ordered, s
 
 
+def estimate_center_tangents(center, fallback_tangent):
+    center = np.asarray(center, dtype=np.float32)
+    fallback_tangent = normalize_rows(fallback_tangent)
+    if len(center) == 0:
+        return center.reshape(0, 2)
+    if len(center) == 1:
+        return fallback_tangent.copy()
+
+    tangent = np.zeros_like(center, dtype=np.float32)
+    tangent[0] = center[1] - center[0]
+    tangent[-1] = center[-1] - center[-2]
+    if len(center) > 2:
+        tangent[1:-1] = center[2:] - center[:-2]
+
+    tangent = normalize_rows(tangent)
+    for idx in range(len(tangent)):
+        if float(np.dot(tangent[idx], fallback_tangent[idx])) < 0.0:
+            tangent[idx] = -tangent[idx]
+    return tangent
+
+
 def smooth_samples(samples, s_values, args):
-    left = np.asarray([sample["m_left"] for sample in samples], dtype=np.float32)
-    right = np.asarray([sample["m_right"] for sample in samples], dtype=np.float32)
     center = np.asarray([sample["c"] for sample in samples], dtype=np.float32)
     tangent = np.asarray([sample["t"] for sample in samples], dtype=np.float32)
     widths = np.asarray([sample["w"] for sample in samples], dtype=np.float32)
     road_z = np.asarray([sample["road_z"] for sample in samples], dtype=np.float32)
 
-    tangent_smooth = normalize_rows(moving_average(tangent, args.dir_window))
-    center_smooth = moving_average(center, args.center_window)
-    left_smooth = moving_average(left, args.edge_window)
-    right_smooth = moving_average(right, args.edge_window)
+    tangent_geom = estimate_center_tangents(center, tangent)
+    tangent_smooth = normalize_rows(moving_average(tangent_geom, args.dir_window))
     width_smooth = moving_average(median_filter_1d(widths, args.width_window), args.width_window)
     road_z_smooth = moving_average(road_z, args.center_window)
 
     fused = []
     for idx, sample in enumerate(samples):
-        left_i = left_smooth[idx]
-        right_i = right_smooth[idx]
-        center_i = center_smooth[idx]
+        center_i = center[idx]
         tangent_i = tangent_smooth[idx]
         normal_i = np.array([-tangent_i[1], tangent_i[0]], dtype=np.float32)
-        width_i = float(np.linalg.norm(left_i - right_i))
+        width_i = float(width_smooth[idx])
         if width_i < 1e-6:
-            width_i = float(width_smooth[idx])
-            left_i = center_i + 0.5 * width_i * normal_i
-            right_i = center_i - 0.5 * width_i * normal_i
-        else:
-            center_i = 0.5 * (left_i + right_i)
+            width_i = float(sample["w"])
+        left_i = center_i + 0.5 * width_i * normal_i
+        right_i = center_i - 0.5 * width_i * normal_i
         fused.append({
             "index": sample["index"],
             "s": float(s_values[idx]),
@@ -377,14 +407,14 @@ def parse_args():
     parser.add_argument("-i", "--input", required=True, help="Path to road_edge_records.json")
     parser.add_argument("-o", "--output", default=None, help="Path to fused output json")
     parser.add_argument("--width-min", type=float, default=1.5, help="Minimum legal road width in meters")
-    parser.add_argument("--width-max", type=float, default=12.0, help="Maximum legal road width in meters")
-    parser.add_argument("--width-dev", type=float, default=2.0, help="Allowed deviation from median width in meters")
+    parser.add_argument("--width-max", type=float, default=20.0, help="Maximum legal road width in meters")
+    parser.add_argument("--width-dev", type=float, default=0.0, help="Allowed deviation from local median width in meters, <=0 disables")
     parser.add_argument("--default-width", type=float, default=4.0, help="Fallback width used to compensate missing sides")
     parser.add_argument("--centroid-thresh", type=float, default=0.0, help="Optional centroid-vs-pseudo-center threshold, 0 disables")
-    parser.add_argument("--dir-window", type=int, default=5, help="Moving-average window for direction smoothing")
+    parser.add_argument("--dir-window", type=int, default=9, help="Moving-average window for direction smoothing")
     parser.add_argument("--center-window", type=int, default=5, help="Moving-average window for center smoothing")
     parser.add_argument("--edge-window", type=int, default=5, help="Moving-average window for edge smoothing")
-    parser.add_argument("--width-window", type=int, default=5, help="Median-plus-average window for width smoothing")
+    parser.add_argument("--width-window", type=int, default=8, help="Median-plus-average window for width smoothing")
     parser.add_argument("--preview", dest="preview", action="store_true", help="Save a PNG preview next to the fused output json")
     parser.add_argument("--no-preview", dest="preview", action="store_false", help="Disable PNG preview generation")
     parser.set_defaults(preview=True)

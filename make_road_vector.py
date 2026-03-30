@@ -36,6 +36,16 @@ def iter_pickled_arrays(path: str) -> Iterator[Array]:
             yield arr.astype(np.float32, copy=False)
 
 
+def load_road_frames(path: str, road_class: int, max_frames: int) -> list:
+    road_frames = []
+    for frame_idx, frame in enumerate(iter_pickled_arrays(path)):
+        if frame_idx >= max_frames:
+            break
+        road = frame[frame[:, 3].astype(np.int32) == road_class][:, :3]
+        road_frames.append(road.astype(np.float32, copy=False))
+    return road_frames
+
+
 def pcd_trans(pcd: Array, dt: Array, dr: Array, inverse: bool = False) -> Array:
     if len(pcd) == 0:
         width = pcd.shape[1] if isinstance(pcd, np.ndarray) and pcd.ndim == 2 else 3
@@ -71,6 +81,25 @@ def rotate_xy(points_xy: Array, yaw: float) -> Array:
     s = float(np.sin(-yaw))
     rot = np.array([[c, -s], [s, c]], dtype=np.float32)
     return points_xy.astype(np.float32, copy=False) @ rot.T
+
+
+def unrotate_xy(points_xy: Array, yaw: float) -> Array:
+    if len(points_xy) == 0:
+        return np.empty((0, 2), dtype=np.float32)
+    c = float(np.cos(yaw))
+    s = float(np.sin(yaw))
+    rot = np.array([[c, -s], [s, c]], dtype=np.float32)
+    return points_xy.astype(np.float32, copy=False) @ rot.T
+
+
+def aligned_edge_to_world(edge_xy: Array, yaw: float, pose: Array) -> Array:
+    if len(edge_xy) == 0:
+        return np.empty((0, 2), dtype=np.float32)
+    local_xy = unrotate_xy(edge_xy, yaw)
+    local_xyz = np.zeros((len(local_xy), 3), dtype=np.float32)
+    local_xyz[:, :2] = local_xy
+    world_xyz = pcd_trans(local_xyz, pose[:3], pose[3:7], False)
+    return world_xyz[:, :2].astype(np.float32, copy=False)
 
 
 def rasterize_points(points_xy: Array, resolution: float, min_points_per_cell: int) -> Tuple[Array, Array, Array]:
@@ -373,14 +402,14 @@ def save_mask(mask: Array, path: str) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Minimal road-only demo: box crop + BEV rasterization")
+    parser = argparse.ArgumentParser(description="Standalone road-edge extraction from all semantic point clouds")
     parser.add_argument("-c", "--config", default="config/outdoor_config.json", help="Config json path")
     parser.add_argument("-i", "--input", default=None, help="Input pickle path")
     parser.add_argument("-t", "--trajectory", default=None, help="Pose csv path")
     parser.add_argument("--road-class", type=int, default=None, help="Road semantic class id")
     parser.add_argument("--window", type=int, default=10, help="Sliding window size")
     parser.add_argument("--step", type=int, default=1, help="Process every N frames")
-    parser.add_argument("--max-frames", type=int, default=9600, help="Maximum frames to read for demo")
+    parser.add_argument("--max-frames", type=int, default=9600, help="Maximum frames to read before processing")
     parser.add_argument("--box-forward", type=float, default=20.0, help="Forward crop range in local frame")
     parser.add_argument("--box-lateral", type=float, default=12.0, help="Lateral crop range in local frame")
     parser.add_argument("--box-z-min", type=float, default=-4.0, help="Minimum z in local frame")
@@ -419,7 +448,14 @@ def main() -> None:
     os.makedirs(output_dir, exist_ok=True)
 
     poses = np.loadtxt(pose_path, delimiter=",").astype(np.float32)
-    window: Deque[Array] = deque(maxlen=args.window)
+    road_frames = load_road_frames(input_path, road_class, min(args.max_frames, len(poses)))
+    if not road_frames:
+        raise ValueError(f"No frames were loaded from {input_path}")
+    process_count = min(len(road_frames), len(poses))
+    if process_count < args.window:
+        raise ValueError(
+            f"Loaded {process_count} frames, fewer than window={args.window}; reduce --window or provide more data"
+        )
 
     last_local_points = np.empty((0, 3), dtype=np.float32)
     last_aligned_points = np.empty((0, 3), dtype=np.float32)
@@ -435,12 +471,9 @@ def main() -> None:
     processed_frame = None
     heading_yaw = None
 
-    for frame_idx, frame in enumerate(iter_pickled_arrays(input_path)):
-        if frame_idx >= args.max_frames or frame_idx >= len(poses):
-            break
-
-        roads = frame[frame[:, 3].astype(np.int32) == road_class][:, :3]
-        window.append(roads)
+    window: Deque[Array] = deque(maxlen=args.window)
+    for frame_idx in range(process_count):
+        window.append(road_frames[frame_idx])
         if len(window) < args.window or frame_idx % args.step != 0:
             continue
 
@@ -469,10 +502,8 @@ def main() -> None:
         )
         left_edge_smooth = smooth_edge_points(left_edge, args.smooth_window)
         right_edge_smooth = smooth_edge_points(right_edge, args.smooth_window)
-        left_ref = merged_left_track[-1] if len(merged_left_track) > 0 else None
-        right_ref = merged_right_track[-1] if len(merged_right_track) > 0 else None
-        left_edge_smooth = select_main_cluster(left_edge_smooth, args.cluster_eps, args.cluster_min_samples, left_ref)
-        right_edge_smooth = select_main_cluster(right_edge_smooth, args.cluster_eps, args.cluster_min_samples, right_ref)
+        left_edge_smooth = select_main_cluster(left_edge_smooth, args.cluster_eps, args.cluster_min_samples)
+        right_edge_smooth = select_main_cluster(right_edge_smooth, args.cluster_eps, args.cluster_min_samples)
         left_edge_smooth = left_edge_smooth[np.argsort(left_edge_smooth[:, 1])] if len(left_edge_smooth) > 0 else left_edge_smooth
         right_edge_smooth = right_edge_smooth[np.argsort(right_edge_smooth[:, 1])] if len(right_edge_smooth) > 0 else right_edge_smooth
         left_is_valid = is_valid_edge_segment(
@@ -494,23 +525,26 @@ def main() -> None:
         if not right_is_valid:
             right_edge_smooth = np.empty((0, 2), dtype=np.float32)
 
+        left_edge_world = aligned_edge_to_world(left_edge_smooth, heading_yaw, pose)
+        right_edge_world = aligned_edge_to_world(right_edge_smooth, heading_yaw, pose)
+
         last_local_points = roads_local
         last_aligned_points = aligned_local
         last_mask = road_mask
         last_left_edge = left_edge
         last_right_edge = right_edge
-        last_left_edge_smooth = left_edge_smooth
-        last_right_edge_smooth = right_edge_smooth
+        last_left_edge_smooth = left_edge_world
+        last_right_edge_smooth = right_edge_world
         merged_left_track = merge_edge_tracks(
             merged_left_track,
-            left_edge_smooth,
+            left_edge_world,
             args.merge_min_spacing,
             args.merge_max_join_dist,
             args.merge_max_heading_diff,
         )
         merged_right_track = merge_edge_tracks(
             merged_right_track,
-            right_edge_smooth,
+            right_edge_world,
             args.merge_min_spacing,
             args.merge_max_join_dist,
             args.merge_max_heading_diff,

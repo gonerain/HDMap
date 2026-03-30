@@ -141,6 +141,166 @@ def keep_largest_road_cluster(roads, eps=1, min_samples=20):
     return roads[labels == largest_label, :3].astype(np.float32, copy=False)
 
 
+def cluster_points(points_xy, eps, min_samples):
+    points_xy = np.asarray(points_xy, dtype=np.float32)
+    if len(points_xy) == 0:
+        return []
+    if len(points_xy) < min_samples:
+        return [points_xy.astype(np.float32, copy=False)]
+
+    labels = DBSCAN(eps=eps, min_samples=min_samples).fit_predict(points_xy)
+    clusters = []
+    for label in np.unique(labels):
+        if label < 0:
+            continue
+        cluster = points_xy[labels == label]
+        if len(cluster) != 0:
+            clusters.append(cluster.astype(np.float32, copy=False))
+    return clusters
+
+
+def cluster_labels(points_xy, eps, min_samples):
+    points_xy = np.asarray(points_xy, dtype=np.float32)
+    if len(points_xy) == 0:
+        return np.full((0,), -1, dtype=np.int32)
+    if len(points_xy) < min_samples:
+        return np.zeros((len(points_xy),), dtype=np.int32)
+    return DBSCAN(eps=eps, min_samples=min_samples).fit_predict(points_xy).astype(np.int32)
+
+
+def fit_edge_segment_from_points(points_xy, axis):
+    points_xy = np.asarray(points_xy, dtype=np.float32)
+    axis = np.asarray(axis, dtype=np.float32).reshape(-1)
+    if len(points_xy) < 2 or len(axis) < 2:
+        return None
+
+    axis = axis[:2]
+    axis_norm = float(np.linalg.norm(axis))
+    if axis_norm < 1e-6:
+        return None
+    axis = axis / axis_norm
+
+    mean = points_xy.mean(axis=0)
+    centered = points_xy - mean
+    cov = centered.T @ centered
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    seg_dir = eigvecs[:, np.argmax(eigvals)].astype(np.float32)
+    if float(np.dot(seg_dir, axis)) < 0.0:
+        seg_dir = -seg_dir
+
+    proj = centered @ seg_dir
+    if len(proj) == 0:
+        return None
+
+    p1 = mean + seg_dir * float(np.min(proj))
+    p2 = mean + seg_dir * float(np.max(proj))
+    seg_len = float(np.linalg.norm(p2 - p1))
+    if seg_len < 1e-6:
+        return None
+
+    midpoint = 0.5 * (p1 + p2)
+    return {
+        'p1': p1.astype(np.float32),
+        'p2': p2.astype(np.float32),
+        'dir': seg_dir.astype(np.float32),
+        'length': seg_len,
+        'midpoint': midpoint.astype(np.float32),
+    }
+
+
+def find_edge_segments_in_frenet(
+    edge_points_xy,
+    centerpoint,
+    dirc,
+    min_lateral_gap=0.5,
+    max_axis_offset=8.0,
+    cluster_eps_longitudinal=1.2,
+    cluster_eps_lateral=0.6,
+    min_cluster_samples=6,
+):
+    edge_points_xy = np.asarray(edge_points_xy, dtype=np.float32)
+    centerpoint = np.asarray(centerpoint, dtype=np.float32).reshape(-1)
+    dirc = np.asarray(dirc, dtype=np.float32).reshape(-1)
+    if len(edge_points_xy) == 0 or len(centerpoint) < 2 or len(dirc) < 2:
+        return []
+
+    axis = dirc[:2]
+    axis_norm = float(np.linalg.norm(axis))
+    if axis_norm < 1e-6:
+        return []
+    axis = axis / axis_norm
+    lateral = np.array([-axis[1], axis[0]], dtype=np.float32)
+    center = centerpoint[:2]
+
+    rel = edge_points_xy[:, :2] - center[None, :]
+    lon = rel @ axis
+    lat = rel @ lateral
+    valid = np.abs(lon) <= float(max_axis_offset)
+    valid &= np.abs(lat) >= float(min_lateral_gap)
+    if not np.any(valid):
+        return []
+
+    points_valid = edge_points_xy[valid, :2]
+    lon_valid = lon[valid]
+    lat_valid = lat[valid]
+
+    def pick_side(side_sign):
+        side_mask = lat_valid * side_sign > 0.0
+        if not np.any(side_mask):
+            return None
+
+        side_points = points_valid[side_mask]
+        side_lon = lon_valid[side_mask]
+        side_lat = lat_valid[side_mask]
+        frenet = np.column_stack((
+            side_lon / max(float(cluster_eps_longitudinal), 1e-3),
+            side_lat / max(float(cluster_eps_lateral), 1e-3),
+        )).astype(np.float32)
+        labels = cluster_labels(frenet, eps=1.0, min_samples=min_cluster_samples)
+        if not np.any(labels >= 0):
+            if len(side_points) < min_cluster_samples:
+                return None
+            point_clusters = [side_points]
+            lon_clusters = [side_lon]
+            lat_clusters = [side_lat]
+        else:
+            point_clusters = []
+            lon_clusters = []
+            lat_clusters = []
+            for label in np.unique(labels):
+                if label < 0:
+                    continue
+                mask = labels == label
+                point_clusters.append(side_points[mask])
+                lon_clusters.append(side_lon[mask])
+                lat_clusters.append(side_lat[mask])
+
+        best_seg = None
+        best_score = -1e9
+        for cluster_points_xy, cluster_lon, cluster_lat in zip(point_clusters, lon_clusters, lat_clusters):
+            seg = fit_edge_segment_from_points(cluster_points_xy, axis)
+            if seg is None:
+                continue
+            mean_abs_lon = float(np.mean(np.abs(cluster_lon)))
+            mean_abs_lat = float(np.mean(np.abs(cluster_lat)))
+            score = (
+                1.5 * len(cluster_points_xy)
+                + seg['length']
+                - 0.2 * mean_abs_lon
+                - 0.05 * mean_abs_lat
+            )
+            if score > best_score:
+                best_score = score
+                best_seg = seg
+        return best_seg
+
+    left_seg = pick_side(-1.0)
+    right_seg = pick_side(1.0)
+    if left_seg is None or right_seg is None:
+        return []
+    return [left_seg, right_seg]
+
+
 def find_parallel_segments_around_center(
     # Search the contour for one left and one right segment aligned with travel direction.
     polyline_xy,
@@ -351,17 +511,18 @@ def process_road_vectorization(index):
         )
         return False
 
-    seg_pair = find_parallel_segments_around_center(
+    seg_pair = find_edge_segments_in_frenet(
         contour_xy,
         road_ctx['current_center'],
         dirc / dirc_norm,
-        min_seg_length=0.5,
-        dir_angle_thresh_deg=15.0,
-        pair_angle_thresh_deg=10.0,
         min_lateral_gap=0.5,
+        max_axis_offset=8.0,
+        cluster_eps_longitudinal=1.5,
+        cluster_eps_lateral=0.8,
+        min_cluster_samples=4,
     )
     if len(seg_pair) != 2:
-        print('skip: no parallel contour segments around centerpoint')
+        print('skip: no left/right edge clusters around centerpoint')
         return False
 
     left_seg, right_seg = seg_pair
@@ -418,8 +579,8 @@ parser.add_argument('-t', '--trajectory', default=None, help='Trajectory file, u
 parser.add_argument('--semantic', default=None, help='Semantic photos folder')
 parser.add_argument('--origin', default=None, help='Origin photos folder')
 parser.add_argument('--vector', default="result/outdoor/road_edge_records.json", help='Do the vectorization, only available when filters are accepted', action='store_true')
-parser.add_argument('--max_index', default=200, type=int, help='Max index to process, default to process all data')
-parser.add_argument('--start_index', default=10000, type=int, help='Start processing from this frame index')
+parser.add_argument('--max_index', default=10000, type=int, help='Max index to process, default to process all data')
+parser.add_argument('--start_index', default=None, type=int, help='Start processing from this frame index')
 args = parser.parse_args()
 
 if args.config:
@@ -434,7 +595,7 @@ args.semantic = args.semantic or config['save_folder'] + '/sempics'
 args.origin = args.origin or config['save_folder'] + '/originpics'
 args.vector = args.vector or config['vector']
 
-step = 20
+step = 2
 window_road = 10
 dirc_window = 20
 static_dirc_thresh = 0.2
