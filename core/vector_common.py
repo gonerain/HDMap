@@ -20,6 +20,10 @@ from sklearn.cluster import DBSCAN
 from util import get_rgba_pcd_msg
 
 
+def default_demo_output_dir(name):
+    return os.path.join("demo_output", name)
+
+
 class FixedQueue(list):
     def __init__(self, capacity=-1):
         super().__init__()
@@ -127,6 +131,9 @@ def keep_largest_cluster(points_xyz, eps=1.0, min_samples=20):
     if len(points_xyz) < min_samples:
         return points_xyz[:, :3].astype(np.float32, copy=False)
 
+    # Large outdoor road windows can easily reach ~200k points.
+    # Running DBSCAN with many workers causes large transient memory spikes and
+    # may get the process OOM-killed, so keep clustering single-process here.
     labels = DBSCAN(eps=eps, min_samples=min_samples, n_jobs=24).fit_predict(points_xyz[:, :3])
     valid = labels >= 0
     if not np.any(valid):
@@ -440,7 +447,7 @@ class VectorProcess(ABC):
     target_class_key = ""
     default_target_class = None
     requires_pose = True
-    step = 50
+    step = 2
     window_size = 10
     dirc_window = 20
     static_dirc_thresh = 0.2
@@ -475,6 +482,10 @@ class VectorProcess(ABC):
         front_points = np.vstack(self.history[:self.window_size])
         last_points = np.vstack(self.history[(2 * self.dirc_window):(2 * self.dirc_window + self.window_size)])
 
+        current_center = current_points[:, :2].mean(axis=0).astype(np.float32) if len(current_points) != 0 else np.zeros((2,), dtype=np.float32)
+        front_center = front_points[:, :2].mean(axis=0).astype(np.float32) if len(front_points) != 0 else np.zeros((2,), dtype=np.float32)
+        last_center = last_points[:, :2].mean(axis=0).astype(np.float32) if len(last_points) != 0 else np.zeros((2,), dtype=np.float32)
+
         if runtime.poses is None:
             front_pose = None
             last_pose = None
@@ -484,16 +495,16 @@ class VectorProcess(ABC):
 
         return {
             "current_points": current_points,
-            "current_center": current_points[:, :2].mean(axis=0).astype(np.float32),
+            "current_center": current_center,
             "front": {
                 "pose": front_pose,
                 "points": front_points,
-                "centerpoint": front_points[:, :2].mean(axis=0).astype(np.float32),
+                "centerpoint": front_center,
             },
             "last": {
                 "pose": last_pose,
                 "points": last_points,
-                "centerpoint": last_points[:, :2].mean(axis=0).astype(np.float32),
+                "centerpoint": last_center,
             },
         }
 
@@ -535,7 +546,7 @@ class VectorProcess(ABC):
         return canvas, to_canvas
 
     def save_debug_canvas(self, logical_index, canvas):
-        debug_dir = self.config.get("debug_output_dir", "demo_output")
+        debug_dir = self.config.get("debug_output_dir", default_demo_output_dir(self.name))
         os.makedirs(debug_dir, exist_ok=True)
         cv2.imwrite(os.path.join(debug_dir, f"{self.name}_centroid_debug_{logical_index:06d}.png"), canvas)
 
@@ -545,14 +556,17 @@ class VectorProcess(ABC):
         image = cv2.imread(runtime.imgs[frame_index])
         if image is None:
             return
-        debug_dir = self.config.get("debug_output_dir", "demo_output")
+        debug_dir = self.config.get("debug_output_dir", default_demo_output_dir(self.name))
         os.makedirs(debug_dir, exist_ok=True)
         cv2.imwrite(os.path.join(debug_dir, f"{self.name}_origin_{logical_index:06d}.png"), image)
 
     def output_path(self):
         if self.args.output:
             return self.args.output
-        return self.config.get(f"{self.name}_vector_output", f"{self.name}_edge_records.json")
+        return self.config.get(
+            f"{self.name}_vector_output",
+            os.path.join(default_demo_output_dir(self.name), f"{self.name}_records.json"),
+        )
 
     def finalize(self):
         output_path = self.output_path()

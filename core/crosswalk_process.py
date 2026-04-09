@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 
+from core.vector_common import default_demo_output_dir
 from core.vector_common import VectorProcess
 from core.vector_common import extract_outline_by_alphashape
 from core.vector_common import keep_largest_cluster
@@ -22,7 +23,10 @@ class CrosswalkProcess(VectorProcess):
     def output_path(self):
         if self.args.output:
             return self.args.output
-        return self.config.get("crosswalk_vector_output", "crosswalk_records.json")
+        return self.config.get(
+            "crosswalk_vector_output",
+            f"{default_demo_output_dir(self.name)}/crosswalk_records.json",
+        )
 
     def make_record(self, logical_index, process_ctx, cluster_points, contour_xy, dirc, lateral, long_range, lat_range, crosswalk_z):
         center_xy = process_ctx["current_center"].astype(np.float32)

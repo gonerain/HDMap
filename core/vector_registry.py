@@ -5,6 +5,7 @@ import numpy as np
 
 from core.crosswalk_process import CrosswalkProcess
 from core.road_process import RoadEdgeProcess
+from core.sidewalk_roadfused_process import SidewalkRoadFusedProcess
 from core.sidewalk_process import SidewalkEdgeProcess
 
 
@@ -12,6 +13,7 @@ PROCESS_REGISTRY = {
     "crosswalk": CrosswalkProcess,
     "road": RoadEdgeProcess,
     "sidewalk": SidewalkEdgeProcess,
+    "sidewalk_roadfused": SidewalkRoadFusedProcess,
 }
 
 
@@ -39,10 +41,10 @@ def load_args_with_config(args):
 
 
 def iterate_frames(runtime, process_obj, args):
-    savepcd = []
     start_index = max(int(args.start_index or 0), 0)
 
     if args.mode == "indoor":
+        savepcd = []
         try:
             sempcds = pickle.load(args.input)
             for frame_index, sempcd in enumerate(sempcds):
@@ -59,7 +61,6 @@ def iterate_frames(runtime, process_obj, args):
         while True:
             sempcd = pickle.load(args.input)
             latest_frame_index += 1
-            savepcd.append(sempcd)
             process_obj.ingest_frame(sempcd)
 
             runtime.publish_pose(latest_frame_index)

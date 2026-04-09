@@ -5,3 +5,5 @@ result/
 __pycache__/
 demo_*/
 *.pyc
+.codex
+doc/

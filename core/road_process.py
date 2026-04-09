@@ -1,7 +1,10 @@
+import os
 import numpy as np
 import cv2
 
+from core.vector_common import default_demo_output_dir
 from core.vector_common import VectorProcess
+from core.vector_common import build_canvas_transform
 from core.vector_common import extract_outline_by_alphashape
 from core.vector_common import find_parallel_segments_around_center
 from core.vector_common import keep_largest_cluster
@@ -21,6 +24,62 @@ class RoadEdgeProcess(VectorProcess):
     parallel_dir_angle_thresh_deg = 15.0
     parallel_pair_angle_thresh_deg = 10.0
     parallel_min_lateral_gap = 0.5
+
+    def _debug_stage_dir(self, stage_name):
+        debug_root = self.config.get("debug_output_dir", default_demo_output_dir(self.name))
+        stage_dir = os.path.join(debug_root, stage_name)
+        os.makedirs(stage_dir, exist_ok=True)
+        return stage_dir
+
+    def _draw_stage_canvas(self, process_ctx, points_xyz=None, polylines=None, segments=None):
+        points_xyz = np.asarray(points_xyz if points_xyz is not None else np.zeros((0, 3), dtype=np.float32), dtype=np.float32)
+        polylines = polylines or []
+        segments = segments or []
+
+        all_xy_parts = [
+            process_ctx["current_center"][None, :],
+            process_ctx["front"]["centerpoint"][None, :],
+            process_ctx["last"]["centerpoint"][None, :],
+        ]
+        if len(points_xyz) != 0:
+            all_xy_parts.append(points_xyz[:, :2])
+        for polyline, _color, _closed, _thickness in polylines:
+            polyline = np.asarray(polyline, dtype=np.float32)
+            if len(polyline) != 0:
+                all_xy_parts.append(polyline[:, :2])
+        for p1, p2, _color, _thickness in segments:
+            all_xy_parts.append(np.vstack((p1[:2], p2[:2])).astype(np.float32))
+
+        to_canvas, canvas = build_canvas_transform(np.vstack(all_xy_parts))
+        if len(points_xyz) != 0:
+            for px, py in to_canvas(points_xyz[:, :2]):
+                cv2.circle(canvas, (int(px), int(py)), 2, (60, 60, 60), -1)
+
+        for polyline, color, is_closed, thickness in polylines:
+            polyline = np.asarray(polyline, dtype=np.float32)
+            if len(polyline) < 2:
+                continue
+            polyline_canvas = to_canvas(polyline[:, :2]).reshape(-1, 1, 2)
+            cv2.polylines(canvas, [polyline_canvas], is_closed, color, thickness)
+
+        for p1, p2, color, thickness in segments:
+            seg_canvas = to_canvas(np.vstack((p1[:2], p2[:2]))).reshape(-1, 1, 2)
+            cv2.polylines(canvas, [seg_canvas], False, color, thickness)
+
+        current_pt = tuple(to_canvas(process_ctx["current_center"][None, :])[0])
+        front_pt = tuple(to_canvas(process_ctx["front"]["centerpoint"][None, :])[0])
+        last_pt = tuple(to_canvas(process_ctx["last"]["centerpoint"][None, :])[0])
+        cv2.circle(canvas, current_pt, 8, (255, 255, 255), -1)
+        cv2.arrowedLine(canvas, current_pt, front_pt, (0, 170, 255), 4, tipLength=0.12)
+        cv2.arrowedLine(canvas, current_pt, last_pt, (0, 200, 0), 4, tipLength=0.12)
+        cv2.putText(canvas, "current centroid", (current_pt[0] + 12, current_pt[1] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (20, 20, 20), 2)
+        cv2.putText(canvas, "front", (front_pt[0] + 12, front_pt[1] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 120, 220), 2)
+        cv2.putText(canvas, "last", (last_pt[0] + 12, last_pt[1] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 140, 0), 2)
+        return canvas
+
+    def _save_stage_canvas(self, logical_index, stage_name, canvas):
+        stage_dir = self._debug_stage_dir(stage_name)
+        cv2.imwrite(os.path.join(stage_dir, f"{self.name}_{logical_index:06d}.png"), canvas)
 
     def make_record(self, logical_index, process_ctx, left_seg, right_seg, dirc, road_z):
         return {
@@ -55,18 +114,36 @@ class RoadEdgeProcess(VectorProcess):
         )
         print(f"{self.name} cluster: {len(cluster_points)} / {len(process_ctx['current_points'])}")
 
-        contour_xy = extract_outline_by_alphashape(cluster_points, alpha=self.outline_alpha)
+        raw_points_canvas = self._draw_stage_canvas(
+            process_ctx,
+            points_xyz=process_ctx["current_points"][:, :3],
+        )
+        self._save_stage_canvas(logical_index, "road_raw_points", raw_points_canvas)
+
+        alpha_contour_xy = extract_outline_by_alphashape(cluster_points, alpha=self.outline_alpha)
+        cluster_alpha_canvas = self._draw_stage_canvas(
+            process_ctx,
+            points_xyz=cluster_points,
+            polylines=[(alpha_contour_xy, (0, 80, 255), True, 3)],
+        )
+        self._save_stage_canvas(logical_index, "road_cluster_alpha", cluster_alpha_canvas)
+
         contour_xy = simplify_polyline_by_slope(
-            contour_xy,
+            alpha_contour_xy,
             angle_thresh_deg=self.simplify_angle_thresh_deg,
             min_seg_length=self.simplify_min_seg_length,
         )
 
         dirc = process_ctx["last"]["centerpoint"] - process_ctx["front"]["centerpoint"]
         dirc_norm = float(np.linalg.norm(dirc))
-        canvas, to_canvas = self.draw_debug_canvas(cluster_points, contour_xy, process_ctx)
+        final_canvas = self._draw_stage_canvas(
+            process_ctx,
+            points_xyz=cluster_points,
+            polylines=[(contour_xy, (255, 160, 80), True, 4)],
+        )
         if dirc_norm < self.static_dirc_thresh:
-            self.save_debug_canvas(logical_index, canvas)
+            self._save_stage_canvas(logical_index, "road_simplified_edges", final_canvas)
+            self.save_debug_canvas(logical_index, final_canvas)
             self.save_origin_debug_image(runtime, logical_index, logical_index)
             print(f"static skip @ {logical_index}: dirc_norm={dirc_norm:.4f}, thresh={self.static_dirc_thresh:.4f}")
             return False
@@ -81,17 +158,26 @@ class RoadEdgeProcess(VectorProcess):
             min_lateral_gap=self.parallel_min_lateral_gap,
         )
         if len(seg_pair) != 2:
+            self._save_stage_canvas(logical_index, "road_simplified_edges", final_canvas)
+            self.save_debug_canvas(logical_index, final_canvas)
+            self.save_origin_debug_image(runtime, logical_index, logical_index)
             print(f"skip: no parallel contour segments for {self.name} around centerpoint")
             return False
 
         left_seg, right_seg = seg_pair
-        left_canvas = to_canvas(np.vstack((left_seg["p1"], left_seg["p2"]))).reshape(-1, 1, 2)
-        right_canvas = to_canvas(np.vstack((right_seg["p1"], right_seg["p2"]))).reshape(-1, 1, 2)
-        cv2.polylines(canvas, [left_canvas], False, (255, 80, 80), 5)
-        cv2.polylines(canvas, [right_canvas], False, (80, 220, 80), 5)
+        final_canvas = self._draw_stage_canvas(
+            process_ctx,
+            points_xyz=cluster_points,
+            polylines=[(contour_xy, (255, 160, 80), True, 4)],
+            segments=[
+                (left_seg["p1"], left_seg["p2"], (255, 80, 80), 5),
+                (right_seg["p1"], right_seg["p2"], (80, 220, 80), 5),
+            ],
+        )
 
         road_z = float(np.median(process_ctx["current_points"][:, 2])) if len(process_ctx["current_points"]) != 0 else 0.0
         self.records.append(self.make_record(logical_index, process_ctx, left_seg, right_seg, dirc / dirc_norm, road_z))
-        self.save_debug_canvas(logical_index, canvas)
+        self._save_stage_canvas(logical_index, "road_simplified_edges", final_canvas)
+        self.save_debug_canvas(logical_index, final_canvas)
         self.save_origin_debug_image(runtime, logical_index, logical_index)
         return True
