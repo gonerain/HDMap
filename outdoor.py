@@ -32,6 +32,7 @@ import multiprocessing as mp
 from threading import Thread
 import argparse
 import json
+import signal
 
 
 def cmkdir(path):
@@ -148,6 +149,58 @@ def class2color(cls,alpha = False):
         return np.array([*c, 255]).astype(np.uint8)
 
 
+STOP_REQUESTED = False
+STOP_REASON = None
+
+
+def request_stop(reason):
+    global STOP_REQUESTED
+    global STOP_REASON
+    if not STOP_REQUESTED:
+        STOP_REQUESTED = True
+        STOP_REASON = reason
+        print(f'stop requested: {reason}')
+        if rospy.core.is_initialized() and not rospy.is_shutdown():
+            rospy.signal_shutdown(reason)
+
+
+def handle_termination_signal(signum, _frame):
+    signal_name = signal.Signals(signum).name
+    request_stop(signal_name)
+
+
+def run_fix_points_pool(lps, gt, gtQ, worker_count=24):
+    if len(lps) == 0:
+        return []
+    worker_count = max(1, min(worker_count, len(lps)))
+    chunks = [chunk for chunk in np.array_split(lps, worker_count) if len(chunk) != 0]
+    if not chunks:
+        return []
+
+    pool = mp.Pool(worker_count)
+    try:
+        results = [pool.apply_async(fix_points, args=(chunk, gt, gtQ)) for chunk in chunks]
+        pool.close()
+        while not all(res.ready() for res in results):
+            if STOP_REQUESTED or rospy.is_shutdown():
+                raise KeyboardInterrupt
+            time.sleep(0.1)
+        fixlp = []
+        for res in results:
+            fixlp.extend(res.get())
+        pool.join()
+        return fixlp
+    except KeyboardInterrupt:
+        request_stop('KeyboardInterrupt in multiprocessing pool')
+        pool.terminate()
+        pool.join()
+        raise
+    except Exception:
+        pool.terminate()
+        pool.join()
+        raise
+
+
 
 
 cmkdir("result/outdoor/originpics")
@@ -159,6 +212,7 @@ parser.add_argument('-b','--bag',help='The recorded ros bag')
 parser.add_argument('-f','--fastfoward',help='Start to play at the nth seconds', default=0,type = float)
 parser.add_argument('-d','--duration',help='Time to play', default=None,type = float)
 parser.add_argument('-u','--undistortion',help='do LiDAR points undistortion',type=bool)
+parser.add_argument('--max-frames', help='Maximum number of aligned frames to save', default=None, type=int)
 args = parser.parse_args()
 
 with open((args.config or 'config/outdoor_config.json'),'r') as f:
@@ -179,7 +233,10 @@ dismatrix = np.matrix(dismatrix)
 
 
 colors = color_classes.astype('uint8')
-rospy.init_node('fix_distortion', anonymous=False, log_level=rospy.DEBUG)
+signal.signal(signal.SIGINT, handle_termination_signal)
+signal.signal(signal.SIGTERM, handle_termination_signal)
+
+rospy.init_node('fix_distortion', anonymous=False, log_level=rospy.DEBUG, disable_signals=True)
 fixCloudPubHandle = rospy.Publisher('dedistortion_cloud', PointCloud2, queue_size=5)
 originCloudPubHandle = rospy.Publisher('origin_cloud', PointCloud2, queue_size=5)
 semanticCloudPubHandle = rospy.Publisher('SemanticCloud', PointCloud2, queue_size=5)
@@ -196,18 +253,8 @@ predict = getattr(predict,config['predict_func'])(config['model_config'],config[
 print('torch ready')
 
 
-bag = Bag(args.bag)
-start = bag.get_start_time()
-start = start+args.fastfoward
-if args.duration != -1:
-    end = start+args.duration
-    end = genpy.Time(end)
-else:
-    end = None
-start = genpy.Time(start)
-
-bagread = bag.read_messages(start_time=start,end_time = end)
-print('bag ready')
+bag = None
+store_file = None
 
 tnow = None
 
@@ -241,16 +288,33 @@ UNDISTORTION = args.undistortion
 briconvert = config['image_compressed'] and bri.compressed_imgmsg_to_cv2 or bri.imgmsg_to_cv2
 
 
-store_file = open(config['save_folder']+'/outdoor.pkl','wb')
 index = 0
 pose_save = []
 road_save = []
+STOP_AFTER_MAX_FRAMES = False
 
-for msg in bagread:
-    #Handle(msg)
-    if len(gtQ) == 0 and msg.topic == config['LiDAR_topic']:
-        continue
-    if not rospy.is_shutdown():
+try:
+    bag = Bag(args.bag)
+    start = bag.get_start_time()
+    start = start+args.fastfoward
+    if args.duration != -1:
+        end = start+args.duration
+        end = genpy.Time(end)
+    else:
+        end = None
+    start = genpy.Time(start)
+
+    bagread = bag.read_messages(start_time=start,end_time = end)
+    print('bag ready')
+
+    store_file = open(config['save_folder']+'/outdoor.pkl','wb')
+
+    for msg in bagread:
+        if STOP_REQUESTED or STOP_AFTER_MAX_FRAMES or rospy.is_shutdown():
+            break
+        #Handle(msg)
+        if len(gtQ) == 0 and msg.topic == config['LiDAR_topic']:
+            continue
         try:
             if msg.topic == config['GNSS_topic']:
                 gnss = msg.message
@@ -279,6 +343,8 @@ for msg in bagread:
 
                 lidar_remove = []
                 for lidartopicmsg in LOQ:
+                    if STOP_REQUESTED or STOP_AFTER_MAX_FRAMES or rospy.is_shutdown():
+                        break
                     lmsg = lidartopicmsg.message
                     lps = np.array(list(pc2.read_points(lmsg)))
                     gtts = lmsg.header.stamp
@@ -293,23 +359,14 @@ for msg in bagread:
                             break
                         lidar_remove.append(lidartopicmsg)
                         gt = getGt(gtts, gtQ)
-                        lps_bak = lps.copy()
                         # TODO
                         # filter self car
                         #lps = lps[(lps[:,0]<-0.7)|(lps[:,0]>0.7)|(lps[:,1]<-1.1)|(lps[:,1]>2.2)]
                         # only process far points, maybe > 10?
                         lps = lps[lps[:,1]>5]
-                        fixlp = []
-                        pool = mp.Pool(24)
-                        per_epoch = int(len(lps)/24)
-                        lps_a = []
-                        for k in range(24):
-                            lps_a.append(lps[k*per_epoch:(k+1)*per_epoch])
-                        results = [pool.apply_async(fix_points, args=(perlps, gt, gtQ)) for perlps in lps_a]
-                        pool.close()
-                        pool.join()
-                        for res in results:
-                            fixlp.extend(res.get())
+                        fixlp = run_fix_points_pool(lps, gt, gtQ)
+                        if STOP_REQUESTED or rospy.is_shutdown():
+                            break
                         fixcloud = pc2.create_cloud(lmsg.header, lmsg.fields, fixlp)
                         fixCloudPubHandle.publish(fixcloud)
                         originCloudPubHandle.publish(lmsg)
@@ -323,6 +380,8 @@ for msg in bagread:
                     LQ.append((gt, pp))
                     image_remove = []
                     for imgtopicmsg in IQ:
+                        if STOP_REQUESTED or STOP_AFTER_MAX_FRAMES or rospy.is_shutdown():
+                            break
                         imgmsg = imgtopicmsg.message
                         imts = imgmsg.header.stamp
                         imgt = getGt(imts,gtQ)
@@ -341,6 +400,11 @@ for msg in bagread:
                             l = l_next
                         else:
                             l = l_last
+                        if args.max_frames is not None and index >= args.max_frames:
+                            STOP_AFTER_MAX_FRAMES = True
+                            request_stop(f'reach max frames {args.max_frames}')
+                            break
+                        print('processing frame %d'%index)
                         index += 1
                         pose_save.append(np.array([*imgt[1], *imgt[2]]))
                         img = briconvert(imgmsg)
@@ -357,11 +421,17 @@ for msg in bagread:
                         cv2.imwrite(config['save_folder']+"/sempics/%06d.png"%index,semimg)
                         semimg = colors[semimg.flatten()].reshape((*semimg.shape, 3))
                         semimgPubHandle.publish(bri.cv2_to_imgmsg(semimg, 'bgr8'))
+                        # Keep pkl / pose.csv / originpics / sempics strictly aligned by index.
+                        # Even if this image yields no semantic points, still dump an empty frame.
                         if len(sem_pcd) != 0:
                             sem_world_pcd = pcd_trans(sem_pcd, imgt[1], imgt[2])
-                            #save result
-                            pickle.dump(sem_world_pcd,store_file)
-                            store_file.flush()
+                        else:
+                            sem_world_pcd = np.zeros((0, 4), dtype=np.float64)
+
+                        pickle.dump(sem_world_pcd,store_file)
+                        store_file.flush()
+
+                        if len(sem_world_pcd) != 0:
                             perf_time_start = time.time()
                             sem_msg = get_rgba_pcd_msg(sem_world_pcd)
                             perf_time_end = time.time()
@@ -375,7 +445,8 @@ for msg in bagread:
                                 road_msg.header.frame_id = 'world'
                                 roadCloudPubHandle.publish(road_msg)
                             print('semantic point publish')
-                    # queue out
+                        else:
+                            print('semantic point publish skipped: empty semantic frame saved for alignment')
                         image_remove.append(imgtopicmsg)
                     for tmp in image_remove:
                         IQ.remove(tmp)
@@ -386,12 +457,21 @@ for msg in bagread:
             elif msg.topic == config['camera_topic']:
                 IQ.append(msg)
         except rospy.ROSInterruptException:
+            request_stop('rospy.ROSInterruptException')
             break
         except KeyboardInterrupt:
-            print('break')
+            request_stop('KeyboardInterrupt')
             break
-pose_save=np.stack(pose_save)
-np.savetxt(config['save_folder']+'/pose.csv',pose_save,delimiter=',')
-store_file.close()
-if len(road_save) != 0:
-    save_nppc(np.vstack(road_save), config['save_folder']+'/road.pcd')
+finally:
+    if store_file is not None:
+        store_file.close()
+    if bag is not None:
+        bag.close()
+
+    pose_array = np.stack(pose_save) if len(pose_save) != 0 else np.empty((0, 7))
+    np.savetxt(config['save_folder']+'/pose.csv',pose_array,delimiter=',')
+    if len(road_save) != 0:
+        save_nppc(np.vstack(road_save), config['save_folder']+'/road.pcd')
+
+    if STOP_REASON:
+        print(f'exit: {STOP_REASON}')

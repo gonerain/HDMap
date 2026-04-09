@@ -1,7 +1,7 @@
 {
     "bag_file":"data/outdoor/outdoor.bag",
     "start_time":120,
-    "play_time":1,
+    "play_time":-1,
     "GNSS_topic":"/acc_pose",
     "LiDAR_topic":"/dedistortion_cloud",
     "cloud_distortion":false,
