@@ -181,3 +181,65 @@ class RoadEdgeProcess(VectorProcess):
         self.save_debug_canvas(logical_index, final_canvas)
         self.save_origin_debug_image(runtime, logical_index, logical_index)
         return True
+
+    def finalize(self):
+        # First save the raw records
+        super().finalize()
+        
+        # Now fuse the records using the existing fusion module
+        try:
+            # Import here to avoid circular imports
+            import sys
+            from pathlib import Path
+            
+            # Add the src directory to path if needed
+            ROOT = Path(__file__).resolve().parents[2]
+            if str(ROOT) not in sys.path:
+                sys.path.insert(0, str(ROOT))
+            
+            from src.vectorize.fuse_road_edges import build_output
+            
+            # Prepare arguments using fusion parameters
+            class Args:
+                def __init__(self, params):
+                    self.method = params["method"]
+                    self.width_min = params["width_min"]
+                    self.width_max = params["width_max"]
+                    self.width_dev = params["width_dev"]
+                    self.max_backtrack = params["max_backtrack"]
+                    self.default_width = params["default_width"]
+                    self.centroid_thresh = params["centroid_thresh"]
+                    self.dir_window = params["dir_window"]
+                    self.center_window = params["center_window"]
+                    self.edge_window = params["edge_window"]
+                    self.width_window = params["width_window"]
+                    self.ls_degree = params["ls_degree"]
+                    self.preview = params["preview"]
+            
+            args = Args(self.fusion_params)
+            
+            # Build the fused output
+            fused, debug = build_output(self.records, args)
+            
+            # Save fused records
+            raw_path = self.output_path()
+            fused_path = os.path.splitext(raw_path)[0] + "_fused.json"
+            output_dir = os.path.dirname(fused_path)
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+            with open(fused_path, "w") as f:
+                json.dump(fused, f, indent=2)
+            print(f"saved fused road records to {fused_path}")
+            
+            # Optionally save preview
+            if self.fusion_params["preview"]:
+                try:
+                    from src.vectorize.fuse_road_edges import save_preview
+                    save_preview(Path(fused_path), self.records, fused, debug)
+                except Exception as e:
+                    print(f"Failed to save preview: {e}")
+                
+        except Exception as e:
+            print(f"Failed to fuse road records: {e}")
+            import traceback
+            traceback.print_exc()
