@@ -7,3 +7,4 @@ demo_*/
 *.pyc
 .codex
 doc/
+.aider*

@@ -57,12 +57,29 @@ def polygon_area_from_outline(outline_xy):
         return 0.0
 
 
+def is_nearly_collinear(points_xy, ratio_thresh=1e-2, min_lateral_span=0.05):
+    points_xy = as_xy(points_xy)
+    if len(points_xy) < 3:
+        return True
+    centered = points_xy - points_xy.mean(axis=0, keepdims=True)
+    try:
+        _u, singular_values, basis = np.linalg.svd(centered, full_matrices=False)
+    except np.linalg.LinAlgError:
+        return True
+    if len(singular_values) < 2 or singular_values[0] < 1e-6:
+        return True
+    axis = basis[0].astype(np.float32, copy=False)
+    lateral = np.array([-axis[1], axis[0]], dtype=np.float32)
+    lateral_span = float((centered @ lateral).max() - (centered @ lateral).min())
+    return float(singular_values[1] / singular_values[0]) < float(ratio_thresh) or lateral_span < float(min_lateral_span)
+
+
 class SidewalkRoadFusedProcess(VectorProcess):
     name = "sidewalk_roadfused"
     target_class_key = "sidewalk_class"
     default_target_class = 15
     requires_pose = False
-    step = 2
+    step = 20
 
     road_fused_input_key = "road_fused_input"
     cluster_eps = 0.9
@@ -418,7 +435,49 @@ class SidewalkRoadFusedProcess(VectorProcess):
         if not points:
             return np.zeros((0, 2), dtype=np.float32)
         merged_points = np.vstack(points)
-        outline = extract_outline_by_alphashape(np.column_stack((merged_points, np.zeros((len(merged_points),), dtype=np.float32))), alpha=self.outline_alpha)
+        if is_nearly_collinear(merged_points):
+            return self.buffered_outline_from_polyline(polyline_arrays)
+        try:
+            outline = extract_outline_by_alphashape(
+                np.column_stack((merged_points, np.zeros((len(merged_points),), dtype=np.float32))),
+                alpha=self.outline_alpha,
+            )
+        except Exception:
+            return self.buffered_outline_from_polyline(polyline_arrays)
+        outline = simplify_polyline_by_slope(
+            outline,
+            angle_thresh_deg=self.simplify_angle_thresh_deg,
+            min_seg_length=self.simplify_min_seg_length,
+        )
+        if len(outline) < 3 or polygon_area_from_outline(outline) <= 1e-6:
+            return self.buffered_outline_from_polyline(polyline_arrays)
+        return outline
+
+    def buffered_outline_from_polyline(self, polyline_arrays):
+        points = []
+        for arr in polyline_arrays:
+            arr = as_xy(arr)
+            if len(arr) != 0:
+                points.append(arr)
+        if not points:
+            return np.zeros((0, 2), dtype=np.float32)
+
+        merged_polyline = np.vstack(points).astype(np.float32, copy=False)
+        if len(merged_polyline) < 2:
+            return np.zeros((0, 2), dtype=np.float32)
+
+        line = polyline_to_linestring(merged_polyline)
+        if line is None:
+            return np.zeros((0, 2), dtype=np.float32)
+
+        # Degenerate sidewalk outlines appear in sparse tracks as nearly straight
+        # line segments. Fall back to a thin buffered ribbon so fusion can finish
+        # and downstream overlay still has an area-like contour to draw.
+        buffer_radius = max(float(self.fused_point_merge_radius), 0.25)
+        polygon = line.buffer(buffer_radius, cap_style=2, join_style=2)
+        if polygon.is_empty:
+            return np.zeros((0, 2), dtype=np.float32)
+        outline = np.asarray(polygon.exterior.coords, dtype=np.float32)
         return simplify_polyline_by_slope(
             outline,
             angle_thresh_deg=self.simplify_angle_thresh_deg,

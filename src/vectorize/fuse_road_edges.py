@@ -6,6 +6,8 @@ from pathlib import Path
 import numpy as np
 
 try:
+    import matplotlib
+    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 except ImportError:
     plt = None
@@ -346,6 +348,62 @@ def smooth_samples(samples, s_values, args):
     return fused
 
 
+def fit_polynomial_curve(s_values, points_xy, degree):
+    s_values = np.asarray(s_values, dtype=np.float32).reshape(-1)
+    points_xy = np.asarray(points_xy, dtype=np.float32)
+    if len(s_values) != len(points_xy):
+        raise ValueError(f"s_values and points_xy must have the same length, got {len(s_values)} and {len(points_xy)}")
+    if len(points_xy) == 0:
+        return points_xy.reshape(0, 2)
+    if len(points_xy) == 1:
+        return points_xy.copy()
+
+    degree = max(1, min(int(degree), len(points_xy) - 1))
+    s_min = float(np.min(s_values))
+    s_max = float(np.max(s_values))
+    s_span = max(s_max - s_min, 1e-6)
+    s_norm = ((s_values - s_min) / s_span) * 2.0 - 1.0
+
+    fitted = np.empty_like(points_xy, dtype=np.float32)
+    for dim in range(points_xy.shape[1]):
+        coeffs = np.polyfit(s_norm, points_xy[:, dim], deg=degree)
+        fitted[:, dim] = np.polyval(coeffs, s_norm).astype(np.float32)
+    return fitted
+
+
+def fit_edges_least_squares(samples, s_values, args):
+    if len(samples) == 0:
+        return []
+
+    left_raw = np.asarray([sample["m_left"] for sample in samples], dtype=np.float32)
+    right_raw = np.asarray([sample["m_right"] for sample in samples], dtype=np.float32)
+    road_z = np.asarray([sample["road_z"] for sample in samples], dtype=np.float32)
+
+    left_fit = fit_polynomial_curve(s_values, left_raw, args.ls_degree)
+    right_fit = fit_polynomial_curve(s_values, right_raw, args.ls_degree)
+    center_fit = 0.5 * (left_fit + right_fit)
+    tangent_fit = estimate_center_tangents(center_fit, np.asarray([sample["t"] for sample in samples], dtype=np.float32))
+    road_z_fit = moving_average(road_z, args.center_window)
+
+    fused = []
+    for idx, sample in enumerate(samples):
+        left_i = left_fit[idx]
+        right_i = right_fit[idx]
+        center_i = center_fit[idx]
+        tangent_i = tangent_fit[idx]
+        width_i = float(np.linalg.norm(left_i - right_i))
+        fused.append({
+            "index": sample["index"],
+            "s": float(s_values[idx]),
+            "center": [float(center_i[0]), float(center_i[1]), float(road_z_fit[idx])],
+            "left_edge": [float(left_i[0]), float(left_i[1]), float(road_z_fit[idx])],
+            "right_edge": [float(right_i[0]), float(right_i[1]), float(road_z_fit[idx])],
+            "t": [float(tangent_i[0]), float(tangent_i[1])],
+            "w": width_i,
+        })
+    return fused
+
+
 def plot_raw_records(ax, records):
     raw_left = []
     raw_right = []
@@ -621,7 +679,12 @@ def save_preview(output_path, records, fused, debug):
 def build_output(records, args):
     filtered, stats, debug = filter_samples(records, args)
     ordered, s_values = compute_station(filtered)
-    fused_samples = smooth_samples(ordered, s_values, args) if len(ordered) != 0 else []
+    if len(ordered) == 0:
+        fused_samples = []
+    elif args.method == "least_squares_edges":
+        fused_samples = fit_edges_least_squares(ordered, s_values, args)
+    else:
+        fused_samples = smooth_samples(ordered, s_values, args)
 
     left_edge = [sample["left_edge"] for sample in fused_samples]
     right_edge = [sample["right_edge"] for sample in fused_samples]
@@ -639,6 +702,7 @@ def build_output(records, args):
             "backtrack_rejected": stats["backtrack_rejected"],
             "side_flipped": stats["side_flipped"],
             "width_median": stats["width_median"],
+            "method": args.method,
             "debug_counts": {
                 "single_side_missing": len(debug["single_side_missing"]),
                 "left_right_swap": len(debug["left_right_swap"]),
@@ -655,6 +719,7 @@ def build_output(records, args):
                 "center_window": args.center_window,
                 "edge_window": args.edge_window,
                 "width_window": args.width_window,
+                "ls_degree": args.ls_degree,
             },
         },
         "left_edge": left_edge,
@@ -669,6 +734,12 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Fuse per-frame road edge records into a smooth road-edge track.")
     parser.add_argument("-i", "--input", required=True, help="Path to road_edge_records.json")
     parser.add_argument("-o", "--output", default=None, help="Path to fused output json")
+    parser.add_argument(
+        "--method",
+        choices=("moving_average", "least_squares_edges"),
+        default="moving_average",
+        help="Fusion method. least_squares_edges fits left/right edges independently with polynomial least squares.",
+    )
     parser.add_argument("--width-min", type=float, default=1.5, help="Minimum legal road width in meters")
     parser.add_argument("--width-max", type=float, default=20.0, help="Maximum legal road width in meters")
     parser.add_argument("--width-dev", type=float, default=0.0, help="Allowed deviation from local median width in meters, <=0 disables")
@@ -679,6 +750,7 @@ def parse_args():
     parser.add_argument("--center-window", type=int, default=5, help="Moving-average window for center smoothing")
     parser.add_argument("--edge-window", type=int, default=5, help="Moving-average window for edge smoothing")
     parser.add_argument("--width-window", type=int, default=8, help="Median-plus-average window for width smoothing")
+    parser.add_argument("--ls-degree", type=int, default=3, help="Polynomial degree for least_squares_edges.")
     parser.add_argument("--preview", dest="preview", action="store_true", help="Save a PNG preview next to the fused output json")
     parser.add_argument("--no-preview", dest="preview", action="store_false", help="Disable PNG preview generation")
     parser.set_defaults(preview=True)

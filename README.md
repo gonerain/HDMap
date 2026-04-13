@@ -189,6 +189,23 @@ topics:      /velodyne_points                   4193 msgs    : sensor_msgs/Point
 ```
 Ros topic will be configured in config file.
 ~~So far, we should configure the ros topics in [outdoor.py]() and [indoor.py]() manually, but as the config file is supported, it can be defined in the config file.~~
+
+## Segmentation Example
+If you only want a minimal semantic segmentation demo for one image, use:
+
+```bash
+python3 examples/segmentation_example.py \
+  --backend detectron2 \
+  --config imseg/mask2former/configs/mapillary-vistas/semantic-segmentation/swin/maskformer2_swin_large_IN21k_384_bs16_300k.yaml \
+  --model imseg/mask2former/model/model.pkl \
+  --image result/outdoor/originpics/000001.png \
+  --output-dir demo_output/segmentation_example
+```
+
+Outputs:
+- `<image_name>_mask.png`: raw class-id mask
+- `<image_name>_overlay.png`: color mask blended with the input image
+
 ## Preprocess
 Please make your own config file refer to the config files in config folder. Here are two example config files for indoor and outdoor. The explanations of each field are below the config files.
 > outdoor config file
