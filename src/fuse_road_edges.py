@@ -1,19 +1,26 @@
 #!/usr/bin/python3
+"""
+This script is deprecated. Road fusion is now integrated into RoadEdgeProcess.
+To fuse road records, simply run make_vector.py with process='road'.
+The fused records will be saved automatically with '_fused.json' suffix.
+"""
 import sys
+import json
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT_DIR = Path(__file__).resolve().parent
-if sys.path:
-    first_path = Path(sys.path[0] or ".").resolve()
-    if first_path == SCRIPT_DIR:
-        sys.path.pop(0)
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.vectorize.fuse_road_edges import main
-
+def main():
+    print("This standalone road fusion script is deprecated.")
+    print("Road fusion is now integrated into RoadEdgeProcess.")
+    print("To fuse road records, simply run make_vector.py with process='road'.")
+    print("The fused records will be saved automatically with '_fused.json' suffix.")
+    
+    # For backward compatibility, we can still try to run the old fusion
+    # But it's better to just exit
+    sys.exit(1)
 
 if __name__ == "__main__":
     main()

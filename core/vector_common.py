@@ -462,6 +462,23 @@ class VectorProcess(ABC):
             raise ValueError(f"target class is not configured for process '{self.name}'")
         self.history = FixedQueue(2 * self.dirc_window + self.window_size)
         self.records = []
+        
+        # Fusion parameters from config or defaults
+        self.fusion_params = {
+            "method": config.get("fusion_method", "moving_average"),
+            "width_min": config.get("width_min", 1.5),
+            "width_max": config.get("width_max", 20.0),
+            "width_dev": config.get("width_dev", 0.0),
+            "max_backtrack": config.get("max_backtrack", 0.3),
+            "default_width": config.get("default_width", 4.0),
+            "centroid_thresh": config.get("centroid_thresh", 0.0),
+            "dir_window": config.get("dir_window", 9),
+            "center_window": config.get("center_window", 5),
+            "edge_window": config.get("edge_window", 5),
+            "width_window": config.get("width_window", 8),
+            "ls_degree": config.get("ls_degree", 3),
+            "preview": config.get("preview", True),
+        }
 
     def ingest_frame(self, sempcd):
         self.history.append(sempcd[sempcd[:, 3] == self.target_class])
