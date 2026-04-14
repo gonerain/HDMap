@@ -1,0 +1,97 @@
+{
+    "bag_file": "data/outdoor/outdoor.bag",
+    "start_time": 120,
+    "play_time": 5,
+    "GNSS_topic": "/acc_pose",
+    "LiDAR_topic": "/dedistortion_cloud",
+    "cloud_distortion": false,
+    "camera_topic": "/image",
+    "image_compressed": true,
+    "extrinsic": [
+        [
+            1.0102,
+            -0.0026,
+            -0.0087,
+            0.1135
+        ],
+        [
+            -0.0033,
+            -0.003,
+            -0.9963,
+            -0.1617
+        ],
+        [
+            0.0049,
+            0.9962,
+            -0.0287,
+            0.0516
+        ],
+        [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+        ]
+    ],
+    "intrinsic": [
+        [
+            543.5046,
+            0,
+            630.7183
+        ],
+        [
+            0,
+            540.5383,
+            350.9063
+        ],
+        [
+            0,
+            0,
+            1
+        ]
+    ],
+    "distortion_matrix": [
+        -0.105873889,
+        0.132265629,
+        -8.55667814e-05,
+        -0.00104098281,
+        -0.0701241428
+    ],
+    "save_folder": "result/outdoor",
+    "mode": "outdoor",
+    "model_config": "imseg/mask2former/config/swin/maskformer2_swin_large_IN21k_384_bs16_300k.yaml",
+    "model_file": "imseg/mask2former/model/model.pkl",
+    "lane_class": 24,
+    "pole_class": 45,
+    "road_class": 13,
+    "sidewalk_class": 15,
+    "crosswalk_class": 23,
+    "vector": true,
+    "vector_process": "road_v2",
+    "max_index": 10000,
+    "start_index": 20,
+    "predict_func": "get_predict_func_detectron",
+    "cmap": "mapillary",
+    "road_v2_step": 20,
+    "road_cluster_eps": 1.0,
+    "road_cluster_min_samples": 20,
+    "road_outline_alpha": 0.8,
+    "road_max_clusters": 3,
+    "road_min_cluster_points": 25,
+    "road_max_cluster_center_dist": 70.0,
+    "road_v2_density_ref": 220.0,
+    "road_v2_eps_scale": 1.15,
+    "road_v2_min_samples_floor": 10,
+    "road_v2_max_clusters": 4,
+    "road_v2_far_dist": 45.0,
+    "road_v2_far_max_clusters": 6,
+    "road_topology_max_index_gap": 32,
+    "road_v2_topology_geom_dist_max": 12.0,
+    "road_v2_topology_geom_dist_gap_scale": 0.12,
+    "road_v2_topology_heading_cos_min": 0.4,
+    "road_v2_topology_bridge_max_index_gap": 160,
+    "road_stage_debug": false,
+    "road_save_final_debug": true,
+    "road_save_origin_debug": false,
+    "preview": false
+}

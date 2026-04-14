@@ -5,6 +5,7 @@ import numpy as np
 
 from core.crosswalk_process import CrosswalkProcess
 from core.road_process import RoadEdgeProcess
+from core.road_process_v2 import RoadEdgeProcessV2
 # from core.sidewalk_roadfused_process import SidewalkRoadFusedProcess  # removed
 from core.sidewalk_process import SidewalkEdgeProcess
 
@@ -12,6 +13,7 @@ from core.sidewalk_process import SidewalkEdgeProcess
 PROCESS_REGISTRY = {
     "crosswalk": CrosswalkProcess,
     "road": RoadEdgeProcess,
+    "road_v2": RoadEdgeProcessV2,
     "sidewalk": SidewalkEdgeProcess,
     # "sidewalk_roadfused": SidewalkRoadFusedProcess,  # removed
 }
