@@ -81,6 +81,12 @@ def extract_midpoint(edge):
     return 0.5 * (p1 + p2)
 
 
+def edge_z_or_default(edge, default_z):
+    if edge is None:
+        return float(default_z)
+    return float(edge.get("z", default_z))
+
+
 def parse_record(record):
     left_edge = record.get("left_edge")
     right_edge = record.get("right_edge")
@@ -94,6 +100,9 @@ def parse_record(record):
     n_hint = np.array([-t_hint[1], t_hint[0]], dtype=np.float32)
     centroid = as_xy(record.get("centroid", [0.0, 0.0]))
     road_z = float(record.get("road_z", 0.0))
+    left_z = edge_z_or_default(left_edge, road_z)
+    right_z = edge_z_or_default(right_edge, road_z)
+    center_z = float(record.get("center_z", 0.5 * (left_z + right_z)))
 
     if m_left is not None and m_right is not None:
         c = 0.5 * (m_left + m_right)
@@ -121,6 +130,9 @@ def parse_record(record):
         "index": int(record.get("index", -1)),
         "centroid": centroid.astype(np.float32),
         "road_z": road_z,
+        "left_z": left_z,
+        "right_z": right_z,
+        "center_z": center_z,
         "m_left": None if m_left is None else m_left.astype(np.float32),
         "m_right": None if m_right is None else m_right.astype(np.float32),
         "c": c.astype(np.float32),
@@ -318,13 +330,17 @@ def smooth_samples(samples, s_values, args):
     center = np.asarray([sample["c"] for sample in samples], dtype=np.float32)
     tangent = np.asarray([sample["t"] for sample in samples], dtype=np.float32)
     widths = np.asarray([sample["w"] for sample in samples], dtype=np.float32)
-    road_z = np.asarray([sample["road_z"] for sample in samples], dtype=np.float32)
+    left_z = np.asarray([sample["left_z"] for sample in samples], dtype=np.float32)
+    right_z = np.asarray([sample["right_z"] for sample in samples], dtype=np.float32)
+    center_z = np.asarray([sample["center_z"] for sample in samples], dtype=np.float32)
 
     center_smooth = moving_average(center, args.center_window)
     tangent_geom = estimate_center_tangents(center_smooth, tangent)
     tangent_smooth = normalize_rows(moving_average(tangent_geom, args.dir_window))
     width_smooth = moving_average(median_filter_1d(widths, args.width_window), args.width_window)
-    road_z_smooth = moving_average(road_z, args.center_window)
+    left_z_smooth = moving_average(median_filter_1d(left_z, args.edge_window), args.edge_window)
+    right_z_smooth = moving_average(median_filter_1d(right_z, args.edge_window), args.edge_window)
+    center_z_smooth = moving_average(center_z, args.center_window)
 
     fused = []
     for idx, sample in enumerate(samples):
@@ -339,9 +355,9 @@ def smooth_samples(samples, s_values, args):
         fused.append({
             "index": sample["index"],
             "s": float(s_values[idx]),
-            "center": [float(center_i[0]), float(center_i[1]), float(road_z_smooth[idx])],
-            "left_edge": [float(left_i[0]), float(left_i[1]), float(road_z_smooth[idx])],
-            "right_edge": [float(right_i[0]), float(right_i[1]), float(road_z_smooth[idx])],
+            "center": [float(center_i[0]), float(center_i[1]), float(center_z_smooth[idx])],
+            "left_edge": [float(left_i[0]), float(left_i[1]), float(left_z_smooth[idx])],
+            "right_edge": [float(right_i[0]), float(right_i[1]), float(right_z_smooth[idx])],
             "t": [float(tangent_i[0]), float(tangent_i[1])],
             "w": width_i,
         })
@@ -377,13 +393,16 @@ def fit_edges_least_squares(samples, s_values, args):
 
     left_raw = np.asarray([sample["m_left"] for sample in samples], dtype=np.float32)
     right_raw = np.asarray([sample["m_right"] for sample in samples], dtype=np.float32)
-    road_z = np.asarray([sample["road_z"] for sample in samples], dtype=np.float32)
+    left_z = np.asarray([sample["left_z"] for sample in samples], dtype=np.float32)
+    right_z = np.asarray([sample["right_z"] for sample in samples], dtype=np.float32)
 
     left_fit = fit_polynomial_curve(s_values, left_raw, args.ls_degree)
     right_fit = fit_polynomial_curve(s_values, right_raw, args.ls_degree)
     center_fit = 0.5 * (left_fit + right_fit)
     tangent_fit = estimate_center_tangents(center_fit, np.asarray([sample["t"] for sample in samples], dtype=np.float32))
-    road_z_fit = moving_average(road_z, args.center_window)
+    left_z_fit = moving_average(median_filter_1d(left_z, args.edge_window), args.edge_window)
+    right_z_fit = moving_average(median_filter_1d(right_z, args.edge_window), args.edge_window)
+    center_z_fit = 0.5 * (left_z_fit + right_z_fit)
 
     fused = []
     for idx, sample in enumerate(samples):
@@ -395,9 +414,9 @@ def fit_edges_least_squares(samples, s_values, args):
         fused.append({
             "index": sample["index"],
             "s": float(s_values[idx]),
-            "center": [float(center_i[0]), float(center_i[1]), float(road_z_fit[idx])],
-            "left_edge": [float(left_i[0]), float(left_i[1]), float(road_z_fit[idx])],
-            "right_edge": [float(right_i[0]), float(right_i[1]), float(road_z_fit[idx])],
+            "center": [float(center_i[0]), float(center_i[1]), float(center_z_fit[idx])],
+            "left_edge": [float(left_i[0]), float(left_i[1]), float(left_z_fit[idx])],
+            "right_edge": [float(right_i[0]), float(right_i[1]), float(right_z_fit[idx])],
             "t": [float(tangent_i[0]), float(tangent_i[1])],
             "w": width_i,
         })
