@@ -2,8 +2,9 @@ make_pcl.py
 *.bag
 *.pkl
 result/
-*__pycache__/
-.aider.*
 .codex
-demo_*
-doc
+doc/
+.aider*
+*.pyc
+demo_*/
+__pycache__/

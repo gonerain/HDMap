@@ -1,65 +1,47 @@
 #!/usr/bin/python3
-import pickle
-import rospy
-from sklearn.cluster import DBSCAN
-from util import get_rgba_pcd_msg
-from sensor_msgs.msg import PointCloud2,Image
-import json
-import numpy as np
-import pandas as pd
 import argparse
-from pclpy import pcl
-import tf
-from cv_bridge import CvBridge
-import time
-import glob
-import cv2
-import re
-from tf import transformations
-from predict import get_colors
 
-height = {'pole': 5, 'lane':-1.1}
-
-global sempcd
-global args
-global index
-global poses
-global br
-global savepcd
-global odom_trans
-global last_points
-global vectors
-global lanepcd
-global roadCloudPubHandle
+from core.vector_common import RuntimeContext
+from core.vector_common import save_nppc
+from core.vector_registry import PROCESS_REGISTRY
+from core.vector_registry import iterate_frames
+from core.vector_registry import load_args_with_config
 
 
-class myqueue(list):
-    def __init__(self, cnt=-1):
-        self.cnt = cnt
-        self.index = 0
-
-    def append(self, obj):
-        self.index+=1
-        if len(self) >= self.cnt and self.cnt != -1:
-            self.remove(self[0])
-        super().append(obj)
-
-    def is_empty(self):
-        if len(self) == 0:
-            return True
-        else:
-            return False
-
-def color2int32(tup):
-    return np.array([*tup[1:], 255]).astype(np.uint8).view('uint32')[0]
+def parse_args():
+    parser = argparse.ArgumentParser(description="Vectorize semantic targets from saved semantic point clouds")
+    parser.add_argument("-c", "--config", help="The config file path, recommand use this method to start the tool")
+    parser.add_argument("-i", "--input", type=argparse.FileType("rb"))
+    parser.add_argument("-m", "--mode", choices=["outdoor", "indoor"], help="Depend on the way to store the pickle file")
+    parser.add_argument("-f", "--filters", default=None, nargs="+", type=int, help="Default to show all the classes, the meaning of each class refers to class.json")
+    parser.add_argument("-s", "--save", default=None, help="Save to pcd file")
+    parser.add_argument("-t", "--trajectory", default=None, help="Trajectory file, use to follow the camera")
+    parser.add_argument("--semantic", default=None, help="Semantic photos folder")
+    parser.add_argument("--origin", default=None, help="Origin photos folder")
+    parser.add_argument("--vector", default=None, help="Enable vectorization", action="store_true")
+    parser.add_argument("--process", choices=sorted(PROCESS_REGISTRY.keys()), default=None, help="Which vectorization process to run")
+    parser.add_argument("--target-class", default=None, type=int, help="Override the class id consumed by the selected process")
+    parser.add_argument("--output", default=None, help="Output JSON path for vector records")
+    parser.add_argument("--max_index", default=10000, type=int, help="Max logical index to process")
+    parser.add_argument("--start_index", default=None, type=int, help="Start processing from this logical frame index")
+    return parser.parse_args()
 
 
-def class2color(cls,alpha = False):
-    c = color_classes[cls]
-    if not alpha:
-        return np.array(c).astype(np.uint8)
-    else:
-        return np.array([*c, 255]).astype(np.uint8)
+def main():
+    args = parse_args()
+    args, config = load_args_with_config(args)
+    runtime = RuntimeContext(args, config)
+    process_cls = PROCESS_REGISTRY[args.process]
+    process_obj = process_cls(args, config)
+
+    savepcd = iterate_frames(runtime, process_obj, args)
+
+    if args.vector:
+        process_obj.finalize()
+
+    if args.save is not None and len(savepcd) != 0:
+        save_nppc(savepcd, args.save, runtime.color_classes)
+
 
 def save_nppc(nparr,fname):
     s = nparr.shape
@@ -153,7 +135,6 @@ def process():
     global last_points
     global vectors
     global lanepcd
-    global roadCloudPubHandle
 
     if args.trajectory:
         p = poses[index]
@@ -209,20 +190,11 @@ def process():
     index += 1
 
 
-    display_pcd = sempcd
     if args.filters:
-        display_pcd = display_pcd[np.in1d(display_pcd[:, 3], args.filters)]
-    sem_msg = get_rgba_pcd_msg(display_pcd)
+        sempcd = sempcd[np.in1d(sempcd[:, 3], args.filters)]
+    sem_msg = get_rgba_pcd_msg(sempcd)
     sem_msg.header.frame_id = 'world'
     semanticCloudPubHandle.publish(sem_msg)
-
-    road_class = config.get('road_class')
-    if road_class is not None:
-        road_pcd = sempcd[sempcd[:, 3] == road_class]
-        if len(road_pcd) != 0:
-            road_msg = get_rgba_pcd_msg(road_pcd)
-            road_msg.header.frame_id = 'world'
-            roadCloudPubHandle.publish(road_msg)
 
     if args.semantic and index < len(simgs):
         simg = cv2.imread(simgs[index],0)
@@ -264,7 +236,6 @@ step = 1
 # start ros
 rospy.init_node('fix_distortion', anonymous=False, log_level=rospy.DEBUG)
 semanticCloudPubHandle = rospy.Publisher('SemanticCloud', PointCloud2, queue_size=5)
-roadCloudPubHandle = rospy.Publisher('RoadCloud', PointCloud2, queue_size=5)
 vecPubHandle = rospy.Publisher('VectorCloud', PointCloud2, queue_size=5)
 testPubHandle = rospy.Publisher('TestCloud', PointCloud2, queue_size=5)
 semimgPubHandle = rospy.Publisher('SemanticImg',Image,queue_size = 5)
@@ -308,14 +279,9 @@ if args.mode == 'indoor':
     savepcd = np.concatenate(sempcds)
 elif args.mode == 'outdoor':
     try:
-        while True:
-            sempcd = pickle.load(args.input)
-            savepcd.append(sempcd)
-            process()
-            #print(index)
-    except EOFError:
-        print('done')
-        savepcd = np.concatenate(savepcd)
+        main()
+    except KeyboardInterrupt:
+        print("interrupted by user")
 
 if args.vector:
     poles = savepcd[np.in1d(savepcd[:, 3], [config['pole_class']])]
@@ -331,18 +297,10 @@ if args.vector:
 
 if args.save is not None:
     save_nppc(savepcd,args.save)
-
-    road_class = config.get('road_class')
-    if road_class is not None:
-        road = savepcd[savepcd[:, 3] == road_class]
-        if len(road) != 0:
-            save_nppc(road, '/'.join(args.save.split('/')[:-1]) + '/road.pcd')
-
-    if args.vector and len(vectors) != 0:
-        lane = np.vstack(vectors)
-        p = np.vstack(poles)
-        v = np.vstack((lane,p))
-        save_nppc(v,'/'.join(args.save.split('/')[:-1])+'/vector.pcd')
+    lane = np.vstack(vectors)
+    p = np.vstack(poles)
+    v = np.vstack((lane,p))
+    save_nppc(v,'/'.join(args.save.split('/')[:-1])+'/vector.pcd')
 
 
 

@@ -26,8 +26,10 @@
     "model_file":"imseg/mask2former/model/model.pkl",
     "lane_class":24,
     "pole_class":45,
+    "sidewalk_class":15,
     "road_class":13,
     "predict_func":"get_predict_func_detectron",
     "vector":false,
+    "vector_process":"road",
     "cmap":"mapillary"
 }
