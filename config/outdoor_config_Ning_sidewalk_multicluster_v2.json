@@ -1,5 +1,5 @@
 {
-    "bag_file":"data/outdoor/outdoor.bag",
+    "bag_file":"data/outdoor/segment_2026-04-21-11-47-12_1.bag",
     "start_time":120,
     "play_time":5,
     "GNSS_topic":"/acc_pose",

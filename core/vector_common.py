@@ -12,7 +12,6 @@ import pandas as pd
 import rospy
 import tf
 from cv_bridge import CvBridge
-from pclpy import pcl
 from predict import get_colors
 from sensor_msgs.msg import Image, PointCloud2
 from shapely.geometry import LineString, MultiPolygon, Polygon
@@ -39,6 +38,8 @@ class FixedQueue(list):
 
 
 def save_nppc(nparr, fname, color_classes):
+    from pclpy import pcl
+
     if nparr.shape[1] == 4:
         tmp = pcl.PointCloud.PointXYZRGBA(
             nparr[:, :3],

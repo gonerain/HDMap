@@ -22,8 +22,8 @@ def parse_args():
     parser.add_argument("--process", choices=sorted(PROCESS_REGISTRY.keys()), default=None, help="Which vectorization process to run")
     parser.add_argument("--target-class", default=None, type=int, help="Override the class id consumed by the selected process")
     parser.add_argument("--output", default=None, help="Output JSON path for vector records")
-    parser.add_argument("--max_index", default=10000, type=int, help="Max logical index to process")
-    parser.add_argument("--start_index", default=None, type=int, help="Start processing from this logical frame index")
+    parser.add_argument("--max_index", "--max-index", dest="max_index", default=10000, type=int, help="Max logical index to process")
+    parser.add_argument("--start_index", "--start-index", dest="start_index", default=None, type=int, help="Start processing from this logical frame index")
     return parser.parse_args()
 
 
@@ -42,6 +42,15 @@ def main():
     if args.save is not None and len(savepcd) != 0:
         save_nppc(savepcd, args.save, runtime.color_classes)
 
+
+if __name__ == "__main__":
+    main()
+
+"""
+Legacy lane/pole vectorization script kept below for reference.
+It used to execute at module import time and intercepted argparse before the
+process registry entrypoint above could handle --process/--output/--max-index.
+The active CLI is now the registry-based main() above.
 
 def save_nppc(nparr,fname):
     s = nparr.shape
@@ -314,3 +323,4 @@ def filter():
     f.setRadiusSearch(0.1)
     f.setMinNeighborsInRadius(10)
     f.filter(fpc)
+"""

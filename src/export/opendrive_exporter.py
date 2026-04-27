@@ -21,9 +21,15 @@ def _as_xy(v):
 
 
 def _dist(p1, p2):
-    dx = float(p2[0]) - float(p1[0])
-    dy = float(p2[1]) - float(p1[1])
-    return math.hypot(dx, dy)
+    return math.hypot(float(p2[0]) - float(p1[0]), float(p2[1]) - float(p1[1]))
+
+
+def _normalize_angle(a):
+    while a > math.pi:
+        a -= 2.0 * math.pi
+    while a < -math.pi:
+        a += 2.0 * math.pi
+    return a
 
 
 def _station(points_xy):
@@ -43,10 +49,10 @@ def _median(values, default=0.0):
         return float(default)
     vals.sort()
     n = len(vals)
-    mid = n // 2
+    m = n // 2
     if n % 2 == 1:
-        return vals[mid]
-    return 0.5 * (vals[mid - 1] + vals[mid])
+        return vals[m]
+    return 0.5 * (vals[m - 1] + vals[m])
 
 
 def _collect_components(data):
@@ -93,6 +99,13 @@ def _collect_components(data):
         if len(s) < 2 or s[-1] < 1e-3:
             continue
 
+        headings = []
+        for i in range(len(points_xy)):
+            if i == len(points_xy) - 1:
+                headings.append(_heading(points_xy[i - 1], points_xy[i]))
+            else:
+                headings.append(_heading(points_xy[i], points_xy[i + 1]))
+
         out.append(
             {
                 "road_id": road_id,
@@ -100,6 +113,7 @@ def _collect_components(data):
                 "points_z": points_z,
                 "widths": widths,
                 "s": s,
+                "headings": headings,
             }
         )
 
@@ -134,6 +148,210 @@ def _build_road_links(components, link_dist_thresh):
     return pred, succ
 
 
+def _fit_arc_k(p0, p1, p2):
+    x1, y1 = p0
+    x2, y2 = p1
+    x3, y3 = p2
+    a = _dist(p0, p1)
+    b = _dist(p1, p2)
+    c = _dist(p0, p2)
+    if a < 1e-6 or b < 1e-6 or c < 1e-6:
+        return 0.0
+    s = 0.5 * (a + b + c)
+    area_sq = max(s * (s - a) * (s - b) * (s - c), 0.0)
+    if area_sq < 1e-12:
+        return 0.0
+    area = math.sqrt(area_sq)
+    k = 4.0 * area / (a * b * c)
+    cross = (x2 - x1) * (y3 - y2) - (y2 - y1) * (x3 - x2)
+    return -k if cross < 0.0 else k
+
+
+def _arc_end_from_start(p0, hdg, k, length):
+    x0, y0 = p0
+    if abs(k) < 1e-9:
+        return x0 + length * math.cos(hdg), y0 + length * math.sin(hdg)
+    r = 1.0 / k
+    hdg2 = hdg + k * length
+    x = x0 + r * (math.sin(hdg2) - math.sin(hdg))
+    y = y0 - r * (math.cos(hdg2) - math.cos(hdg))
+    return x, y
+
+
+def _make_geom_segments(comp, arc_fit_tol=0.6, arc_k_min=1e-4, arc_k_max=0.25):
+    pts = comp["points_xy"]
+    s = comp["s"]
+    hdgs = comp["headings"]
+    segs = []
+
+    for i in range(len(pts) - 1):
+        p0 = pts[i]
+        p1 = pts[i + 1]
+        ds = s[i + 1] - s[i]
+        if ds < 1e-6:
+            continue
+        h0 = hdgs[i]
+
+        use_arc = False
+        k = 0.0
+        if i + 2 < len(pts):
+            k = _fit_arc_k(pts[i], pts[i + 1], pts[i + 2])
+            if abs(k) >= arc_k_min and abs(k) <= arc_k_max:
+                pred = _arc_end_from_start(p0, h0, k, ds)
+                err = _dist(pred, p1)
+                if err <= arc_fit_tol:
+                    use_arc = True
+
+        if use_arc:
+            segs.append(
+                {
+                    "type": "arc",
+                    "s": s[i],
+                    "x": p0[0],
+                    "y": p0[1],
+                    "hdg": h0,
+                    "length": ds,
+                    "curvature": k,
+                }
+            )
+            continue
+
+        # paramPoly3 fallback in local frame, U(s)=s, V(s)=c*s^2+d*s^3
+        h1 = hdgs[i + 1] if i + 1 < len(hdgs) else h0
+        dh = _normalize_angle(h1 - h0)
+        dx = p1[0] - p0[0]
+        dy = p1[1] - p0[1]
+        x_local = dx * math.cos(h0) + dy * math.sin(h0)
+        y_local = -dx * math.sin(h0) + dy * math.cos(h0)
+        m1 = math.tan(dh)
+        c_v = (3.0 * y_local - m1 * ds) / (ds * ds)
+        d_v = (m1 * ds - 2.0 * y_local) / (ds * ds * ds)
+
+        # If almost straight and aligned, keep line to reduce verbosity.
+        if abs(y_local) < 0.02 and abs(dh) < 0.02 and abs(x_local - ds) < 0.05:
+            segs.append(
+                {
+                    "type": "line",
+                    "s": s[i],
+                    "x": p0[0],
+                    "y": p0[1],
+                    "hdg": h0,
+                    "length": ds,
+                }
+            )
+        else:
+            segs.append(
+                {
+                    "type": "paramPoly3",
+                    "s": s[i],
+                    "x": p0[0],
+                    "y": p0[1],
+                    "hdg": h0,
+                    "length": ds,
+                    "aU": 0.0,
+                    "bU": 1.0,
+                    "cU": 0.0,
+                    "dU": 0.0,
+                    "aV": 0.0,
+                    "bV": 0.0,
+                    "cV": c_v,
+                    "dV": d_v,
+                    "pRange": "arcLength",
+                }
+            )
+    return segs
+
+
+def _cluster_endpoints_for_junctions(components, radius=8.0):
+    endpoints = []
+    for c in components:
+        rid = c["road_id"]
+        endpoints.append({"road_id": rid, "end": "start", "pt": c["points_xy"][0]})
+        endpoints.append({"road_id": rid, "end": "end", "pt": c["points_xy"][-1]})
+
+    n = len(endpoints)
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if _dist(endpoints[i]["pt"], endpoints[j]["pt"]) <= radius:
+                union(i, j)
+
+    groups = {}
+    for i in range(n):
+        r = find(i)
+        groups.setdefault(r, []).append(endpoints[i])
+
+    clusters = []
+    for g in groups.values():
+        roads = {e["road_id"] for e in g}
+        if len(roads) < 2:
+            continue
+        starts = [e for e in g if e["end"] == "start"]
+        ends = [e for e in g if e["end"] == "end"]
+        if not starts or not ends:
+            continue
+        if len(g) < 3:
+            continue
+        clusters.append({"items": g, "starts": starts, "ends": ends})
+    return clusters
+
+
+def _build_junctions_and_maps(components, direct_pred, direct_succ, junction_radius=8.0):
+    clusters = _cluster_endpoints_for_junctions(components, radius=junction_radius)
+    if not clusters:
+        return [], {}, {}
+
+    road_end_to_junction = {}
+    junctions = []
+    jid_base = 1000
+
+    for idx, cl in enumerate(clusters):
+        jid = str(jid_base + idx)
+        connections = []
+        for e_in in cl["ends"]:
+            for e_out in cl["starts"]:
+                if e_in["road_id"] == e_out["road_id"]:
+                    continue
+                connections.append(
+                    {
+                        "incomingRoad": str(e_in["road_id"]),
+                        "connectingRoad": str(e_out["road_id"]),
+                        "contactPoint": "start",
+                    }
+                )
+
+        if not connections:
+            continue
+
+        for it in cl["items"]:
+            road_end_to_junction[(it["road_id"], it["end"])] = jid
+
+        junctions.append({"id": jid, "connections": connections})
+
+    # Override direct links only at ends participating in junction.
+    pred = dict(direct_pred)
+    succ = dict(direct_succ)
+    for (rid, end), _jid in road_end_to_junction.items():
+        if end == "start":
+            pred[rid] = None
+        else:
+            succ[rid] = None
+
+    return junctions, road_end_to_junction, {"pred": pred, "succ": succ}
+
+
 def _add_header(root, north, south, east, west):
     header = SubElement(
         root,
@@ -142,7 +360,7 @@ def _add_header(root, north, south, east, west):
             "revMajor": "1",
             "revMinor": "4",
             "name": "HDMap Export",
-            "version": "0.1",
+            "version": "0.2",
             "date": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
             "north": _fmt(north),
             "south": _fmt(south),
@@ -154,28 +372,41 @@ def _add_header(root, north, south, east, west):
     SubElement(header, "geoReference").text = "LOCAL_CS"
 
 
-def _add_plan_view(road_elem, comp):
+def _add_plan_view(road_elem, comp, arc_fit_tol, arc_k_min, arc_k_max):
     plan = SubElement(road_elem, "planView")
-    pts = comp["points_xy"]
-    s = comp["s"]
-    for i in range(len(pts) - 1):
-        p1 = pts[i]
-        p2 = pts[i + 1]
-        length = _dist(p1, p2)
-        if length < 1e-6:
-            continue
+    geoms = _make_geom_segments(comp, arc_fit_tol=arc_fit_tol, arc_k_min=arc_k_min, arc_k_max=arc_k_max)
+    for g in geoms:
         geom = SubElement(
             plan,
             "geometry",
             {
-                "s": _fmt(s[i]),
-                "x": _fmt(p1[0]),
-                "y": _fmt(p1[1]),
-                "hdg": _fmt(_heading(p1, p2)),
-                "length": _fmt(length),
+                "s": _fmt(g["s"]),
+                "x": _fmt(g["x"]),
+                "y": _fmt(g["y"]),
+                "hdg": _fmt(g["hdg"]),
+                "length": _fmt(g["length"]),
             },
         )
-        SubElement(geom, "line")
+        if g["type"] == "line":
+            SubElement(geom, "line")
+        elif g["type"] == "arc":
+            SubElement(geom, "arc", {"curvature": _fmt(g["curvature"])})
+        else:
+            SubElement(
+                geom,
+                "paramPoly3",
+                {
+                    "aU": _fmt(g["aU"]),
+                    "bU": _fmt(g["bU"]),
+                    "cU": _fmt(g["cU"]),
+                    "dU": _fmt(g["dU"]),
+                    "aV": _fmt(g["aV"]),
+                    "bV": _fmt(g["bV"]),
+                    "cV": _fmt(g["cV"]),
+                    "dV": _fmt(g["dV"]),
+                    "pRange": g["pRange"],
+                },
+            )
 
 
 def _add_elevation(road_elem, comp):
@@ -190,13 +421,7 @@ def _add_elevation(road_elem, comp):
         SubElement(
             elev,
             "elevation",
-            {
-                "s": _fmt(s[i]),
-                "a": _fmt(z[i]),
-                "b": _fmt(b),
-                "c": "0",
-                "d": "0",
-            },
+            {"s": _fmt(s[i]), "a": _fmt(z[i]), "b": _fmt(b), "c": "0", "d": "0"},
         )
 
 
@@ -225,7 +450,15 @@ def _add_lanes(road_elem, comp):
     SubElement(right_lane, "roadMark", {"sOffset": "0", "type": "solid", "weight": "standard", "color": "standard", "width": "0.15"})
 
 
-def export_opendrive(input_path, output_path, link_dist_thresh=12.0):
+def export_opendrive(
+    input_path,
+    output_path,
+    link_dist_thresh=12.0,
+    junction_radius=8.0,
+    arc_fit_tol=0.6,
+    arc_k_min=1e-4,
+    arc_k_max=0.25,
+):
     data = json.loads(Path(input_path).read_text())
     comps = _collect_components(data)
 
@@ -236,7 +469,15 @@ def export_opendrive(input_path, output_path, link_dist_thresh=12.0):
     root = Element("OpenDRIVE")
     _add_header(root, north=max(ys), south=min(ys), east=max(xs), west=min(xs))
 
-    pred_map, succ_map = _build_road_links(comps, link_dist_thresh=link_dist_thresh)
+    direct_pred, direct_succ = _build_road_links(comps, link_dist_thresh=link_dist_thresh)
+    junctions, end2junc, links = _build_junctions_and_maps(
+        comps,
+        direct_pred,
+        direct_succ,
+        junction_radius=junction_radius,
+    )
+    pred_map = links.get("pred", direct_pred)
+    succ_map = links.get("succ", direct_succ)
 
     for comp in comps:
         rid = comp["road_id"]
@@ -247,18 +488,41 @@ def export_opendrive(input_path, output_path, link_dist_thresh=12.0):
                 "name": f"road_{rid}",
                 "length": _fmt(comp["s"][-1]),
                 "id": str(rid),
-                "junction": "-1",
+                "junction": end2junc.get((rid, "start"), end2junc.get((rid, "end"), "-1")),
             },
         )
+
         link = SubElement(road, "link")
-        if pred_map.get(rid) is not None:
+
+        if (rid, "start") in end2junc:
+            SubElement(link, "predecessor", {"elementType": "junction", "elementId": end2junc[(rid, "start")]})
+        elif pred_map.get(rid) is not None:
             SubElement(link, "predecessor", {"elementType": "road", "elementId": str(pred_map[rid]), "contactPoint": "end"})
-        if succ_map.get(rid) is not None:
+
+        if (rid, "end") in end2junc:
+            SubElement(link, "successor", {"elementType": "junction", "elementId": end2junc[(rid, "end")]})
+        elif succ_map.get(rid) is not None:
             SubElement(link, "successor", {"elementType": "road", "elementId": str(succ_map[rid]), "contactPoint": "start"})
 
-        _add_plan_view(road, comp)
+        _add_plan_view(road, comp, arc_fit_tol=arc_fit_tol, arc_k_min=arc_k_min, arc_k_max=arc_k_max)
         _add_elevation(road, comp)
         _add_lanes(road, comp)
+
+    for j in junctions:
+        je = SubElement(root, "junction", {"id": j["id"], "name": f"junction_{j['id']}"})
+        for cid, conn in enumerate(j["connections"]):
+            ce = SubElement(
+                je,
+                "connection",
+                {
+                    "id": str(cid),
+                    "incomingRoad": conn["incomingRoad"],
+                    "connectingRoad": conn["connectingRoad"],
+                    "contactPoint": conn["contactPoint"],
+                },
+            )
+            SubElement(ce, "laneLink", {"from": "1", "to": "1"})
+            SubElement(ce, "laneLink", {"from": "-1", "to": "-1"})
 
     xml_bytes = tostring(root, encoding="utf-8")
     pretty = minidom.parseString(xml_bytes).toprettyxml(indent="  ", encoding="utf-8")
@@ -269,13 +533,25 @@ def parse_args():
     p = argparse.ArgumentParser(description="Export fused road JSON to OpenDRIVE (.xodr)")
     p.add_argument("-i", "--input", required=True, help="Input fused road JSON")
     p.add_argument("-o", "--output", required=True, help="Output .xodr path")
-    p.add_argument("--link-dist-thresh", type=float, default=12.0, help="Max distance for road predecessor/successor linking")
+    p.add_argument("--link-dist-thresh", type=float, default=12.0, help="Max distance for direct road predecessor/successor linking")
+    p.add_argument("--junction-radius", type=float, default=8.0, help="Endpoint clustering radius for junction detection")
+    p.add_argument("--arc-fit-tol", type=float, default=0.6, help="Arc fitting endpoint tolerance")
+    p.add_argument("--arc-k-min", type=float, default=1e-4, help="Minimum curvature magnitude for arc")
+    p.add_argument("--arc-k-max", type=float, default=0.25, help="Maximum curvature magnitude for arc")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
-    export_opendrive(args.input, args.output, link_dist_thresh=float(args.link_dist_thresh))
+    export_opendrive(
+        args.input,
+        args.output,
+        link_dist_thresh=float(args.link_dist_thresh),
+        junction_radius=float(args.junction_radius),
+        arc_fit_tol=float(args.arc_fit_tol),
+        arc_k_min=float(args.arc_k_min),
+        arc_k_max=float(args.arc_k_max),
+    )
     print(f"saved OpenDRIVE to {args.output}")
 
 

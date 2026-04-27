@@ -13,8 +13,6 @@ import cv2
 from sklearn.cluster import DBSCAN
 from cv_bridge import CvBridge
 import collections
-import pclpy
-from pclpy import pcl
 import multiprocessing as mp
 from predict import get_colors
 
@@ -45,7 +43,6 @@ INIT = None
 tmp = None
 pc2Point = collections.namedtuple('pc2Point', ['x', 'y', 'z', 'intensity', 'ring', 'time'])
 pc2PointRGB = collections.namedtuple('pc2PointRGB', ['x', 'y', 'z', 'rgba'])
-pcfilter = pclpy.pcl.filters.StatisticalOutlierRemoval.PointXYZRGBA()
 br = tf.TransformBroadcaster()
 
 e_i = extrinsic.I
@@ -110,11 +107,15 @@ def transformPointCloud(Tf,target_frame, point_cloud):
     return r
 
 def save_pc(pcmsg, fname):
+    from pclpy import pcl
+
     data = pc2.read_points(pcmsg)
     tmp = pcl.PointCloud(np.array(data).astype(np.float32)[:,:3])
     pcl.save(tmp, fname)
 
 def save_nppc(nparr,fname):
+    from pclpy import pcl
+
     s = nparr.shape
     if s[1] == 4:#rgb
         tmp = pcl.PointCloud.PointXYZRGBA(nparr[:,:3],np.array([color_classes[int(i)] for i in nparr[:,3]]))

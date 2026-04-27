@@ -209,7 +209,7 @@ cmkdir("result/outdoor/sempics")
 parser = argparse.ArgumentParser(description='Semantic point cloud builder, due to the large computation, map construction is devided into several steps to avoid interrupting in case')
 parser.add_argument('-c','--config',help='The config file path, recommand use this method to start the tool')
 parser.add_argument('-b','--bag',help='The recorded ros bag')
-parser.add_argument('-f','--fastfoward',help='Start to play at the nth seconds', default=0,type = float)
+parser.add_argument('-f','--fastfoward',help='Start to play at the nth seconds', default=None,type = float)
 parser.add_argument('-d','--duration',help='Time to play', default=None,type = float)
 parser.add_argument('-u','--undistortion',help='do LiDAR points undistortion',type=bool)
 parser.add_argument('--max-frames', help='Maximum number of aligned frames to save', default=None, type=int)
@@ -217,10 +217,10 @@ args = parser.parse_args()
 
 with open((args.config or 'config/outdoor_config.json'),'r') as f:
     config = json.load(f)
-args.bag = (args.bag or config['bag_file'])
-args.fastfoward = (args.fastfoward or config['start_time'])
-args.duration = (args.duration or config['play_time'])
-args.undistortion = (args.undistortion or config['cloud_distortion'])
+args.bag = args.bag if args.bag is not None else config['bag_file']
+args.fastfoward = args.fastfoward if args.fastfoward is not None else config['start_time']
+args.duration = args.duration if args.duration is not None else config['play_time']
+args.undistortion = args.undistortion if args.undistortion is not None else config['cloud_distortion']
 road_class = config.get('road_class', 13)
 
 color_classes = get_colors(config['cmap'])
@@ -292,6 +292,10 @@ index = 0
 pose_save = []
 road_save = []
 STOP_AFTER_MAX_FRAMES = False
+msg_total = 0
+msg_gnss = 0
+msg_lidar = 0
+msg_camera = 0
 
 try:
     bag = Bag(args.bag)
@@ -310,13 +314,16 @@ try:
     store_file = open(config['save_folder']+'/outdoor.pkl','wb')
 
     for msg in bagread:
+        msg_total += 1
         if STOP_REQUESTED or STOP_AFTER_MAX_FRAMES or rospy.is_shutdown():
             break
         #Handle(msg)
         if len(gtQ) == 0 and msg.topic == config['LiDAR_topic']:
+            msg_lidar += 1
             continue
         try:
             if msg.topic == config['GNSS_topic']:
+                msg_gnss += 1
                 gnss = msg.message
                 if not INIT:
                     INIT = [gnss.latitude, gnss.longitude, gnss.altitude, gnss.azimuth, 0, 0, 0]
@@ -453,8 +460,10 @@ try:
                 for tmp in lidar_remove:
                     LOQ.remove(tmp)
             elif msg.topic == config['LiDAR_topic']:
+                msg_lidar += 1
                 LOQ.append(msg)
             elif msg.topic == config['camera_topic']:
+                msg_camera += 1
                 IQ.append(msg)
         except rospy.ROSInterruptException:
             request_stop('rospy.ROSInterruptException')
@@ -475,3 +484,12 @@ finally:
 
     if STOP_REASON:
         print(f'exit: {STOP_REASON}')
+    print(
+        'summary: total_msgs=%d gnss=%d lidar=%d camera=%d processed_frames=%d'
+        % (msg_total, msg_gnss, msg_lidar, msg_camera, index)
+    )
+    if index == 0:
+        print(
+            'warning: processed_frames is 0. Check start_time/duration window and topic names in config '
+            '(GNSS/LiDAR/camera) against rosbag topics.'
+        )
