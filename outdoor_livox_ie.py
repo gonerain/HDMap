@@ -25,9 +25,12 @@ from util import bri
 from util import get_colors
 from util import get_i_pcd_msg
 from util import get_rgba_pcd_msg
-from util import img2pcl
-from util import pcl2image
 from util import save_nppc
+
+os.environ.setdefault("OMP_NUM_THREADS", "2")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
+os.environ.setdefault("MKL_NUM_THREADS", "2")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "2")
 
 
 STOP_REQUESTED = False
@@ -129,12 +132,22 @@ def load_ie_poses(ie_path):
 class IePoseProvider:
     def __init__(self, poses):
         self.poses = poses
-        self.timestamps = [p.timestamp for p in poses]
+        # Pre-extract numpy arrays once so per-point batch interpolation
+        # avoids re-walking the Python list on every lidar packet.
+        self.timestamps = np.asarray([p.timestamp for p in poses], dtype=np.float64)
+        self._lat = np.asarray([p.latitude_deg for p in poses], dtype=np.float64)
+        self._lon = np.asarray([p.longitude_deg for p in poses], dtype=np.float64)
+        self._h = np.asarray([p.height_m for p in poses], dtype=np.float64)
+        self._roll = np.asarray([p.roll_deg for p in poses], dtype=np.float64)
+        self._pitch = np.asarray([p.pitch_deg for p in poses], dtype=np.float64)
+        self._heading = np.asarray([p.heading_deg for p in poses], dtype=np.float64)
+        # Plain Python list version of timestamps for the scalar bisect path.
+        self._timestamps_list = self.timestamps.tolist()
 
     def get_interpolated(self, timestamp):
         if not self.poses:
             return None
-        right = bisect.bisect_right(self.timestamps, float(timestamp))
+        right = bisect.bisect_right(self._timestamps_list, float(timestamp))
         left = max(0, min(len(self.poses) - 1, right - 1))
         lp = self.poses[left]
         if left + 1 >= len(self.poses):
@@ -154,12 +167,235 @@ class IePoseProvider:
             heading_deg=lerp_angle_deg(lp.heading_deg, rp.heading_deg, alpha),
         )
 
+    def get_interpolated_batch(self, timestamps):
+        """Vectorized version of get_interpolated for an (n,) array of times.
+
+        Returns a dict of (n,) numpy arrays — same fields as IePose. Used by
+        `undistort_livox_points_to_base` to avoid a per-point Python loop
+        over `get_interpolated`, which was a primary cause of system stalls.
+        """
+        n_ie = len(self.poses)
+        if n_ie == 0:
+            return None
+        ts = np.asarray(timestamps, dtype=np.float64)
+        right = np.searchsorted(self.timestamps, ts, side="right")
+        left = np.clip(right - 1, 0, n_ie - 1)
+        right = np.clip(right, 0, n_ie - 1)
+        t_left = self.timestamps[left]
+        t_right = self.timestamps[right]
+        dt = t_right - t_left
+        alpha = np.where(dt > 1e-9, (ts - t_left) / dt, 0.0)
+        alpha = np.clip(alpha, 0.0, 1.0)
+
+        def _lerp(a, b):
+            return a + alpha * (b - a)
+
+        def _lerp_ang(a, b):
+            d = (b - a + 180.0) % 360.0 - 180.0
+            return a + d * alpha
+
+        return {
+            "timestamp": ts,
+            "latitude_deg": _lerp(self._lat[left], self._lat[right]),
+            "longitude_deg": _lerp(self._lon[left], self._lon[right]),
+            "height_m": _lerp(self._h[left], self._h[right]),
+            "roll_deg": _lerp_ang(self._roll[left], self._roll[right]),
+            "pitch_deg": _lerp_ang(self._pitch[left], self._pitch[right]),
+            "heading_deg": _lerp_ang(self._heading[left], self._heading[right]),
+        }
+
 
 def lerp_angle_deg(a_deg, b_deg, alpha):
     a = float(a_deg)
     b = float(b_deg)
     delta = (b - a + 180.0) % 360.0 - 180.0
     return a + delta * float(alpha)
+
+
+def _ecef_to_geodetic(ecef):
+    """Zhu 1994 closed-form ECEF → (lat_deg, lon_deg, height_m)."""
+    x, y, z = float(ecef[0]), float(ecef[1]), float(ecef[2])
+    a, b = 6378137.0, 6356752.3142
+    e2 = 1.0 - (b / a) ** 2
+    ep2 = (a / b) ** 2 - 1.0
+    p = math.sqrt(x * x + y * y)
+    theta = math.atan2(z * a, p * b)
+    lat = math.atan2(z + ep2 * b * math.sin(theta) ** 3,
+                     p - e2 * a * math.cos(theta) ** 3)
+    lon = math.atan2(y, x)
+    sin_lat = math.sin(lat)
+    N = a / math.sqrt(1.0 - e2 * sin_lat * sin_lat)
+    cos_lat = math.cos(lat)
+    h = (p / cos_lat - N) if abs(cos_lat) > 1e-6 else (abs(z) / abs(sin_lat) - N * (1.0 - e2))
+    return math.degrees(lat), math.degrees(lon), h
+
+
+def _euler_zyx_to_matrix(roll_deg, pitch_deg, yaw_deg):
+    """ZYX active rotation matrix R_world_from_body from FAST-LIO2 Euler angles."""
+    r = math.radians(roll_deg)
+    p = math.radians(pitch_deg)
+    y = math.radians(yaw_deg)
+    cr, sr = math.cos(r), math.sin(r)
+    cp, sp = math.cos(p), math.sin(p)
+    cy, sy = math.cos(y), math.sin(y)
+    Rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]], dtype=np.float64)
+    Ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]], dtype=np.float64)
+    Rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]], dtype=np.float64)
+    return Rz @ Ry @ Rx
+
+
+def _r_enu_from_body_to_ie_angles(R):
+    """Extract IE (roll, pitch, heading) from R_enu_from_body (3×3).
+
+    Inverts rotation_matrix_from_ie using the identity:
+        R_enu_from_body = R_enu_from_rfu @ R_rfu_from_flu
+        R_rfu_from_enu  = Ry(-roll) @ Rx(-pitch) @ Rz(heading)
+
+    scipy intrinsic 'zxy' as_euler([a,b,c]) means R = Ry(c) @ Rx(b) @ Rz(a),
+    so the three angles map to [heading, -pitch, -roll].
+    """
+    from scipy.spatial.transform import Rotation as _Rot
+    R_flu_from_rfu = np.array([[0, 1, 0], [-1, 0, 0], [0, 0, 1]], dtype=np.float64)
+    R_enu_from_rfu = R @ R_flu_from_rfu
+    R_rfu_from_enu = R_enu_from_rfu.T
+    angles = _Rot.from_matrix(R_rfu_from_enu).as_euler("zxy", degrees=True)
+    heading = angles[0]
+    pitch = -angles[1]
+    roll = -angles[2]
+    return float(roll), float(pitch), float(heading)
+
+
+class FlioProvider:
+    """IePoseProvider-compatible pose source backed by FAST-LIO2 mat_pre.txt.
+
+    Anchors the FAST-LIO2 odometry world frame to the absolute ENU frame using
+    a single IE reference pose at *anchor_time* (typically the first lidar frame
+    timestamp).  All subsequent poses come from FAST-LIO2 relative motion, so
+    frame-to-frame accuracy reflects LiDAR-IMU SLAM rather than float GNSS.
+    """
+
+    def __init__(self, mat_pre_path, first_lidar_time, anchor_ie_pose, ecef_origin, enu_from_ecef):
+        data = np.loadtxt(mat_pre_path)  # (N, 25)
+        t_rel = data[:, 0]
+        euler_deg = data[:, 1:4]   # roll, pitch, yaw  (body in FAST-LIO2 world)
+        pos_world = data[:, 4:7]   # position in FAST-LIO2 world frame (metres)
+
+        self.timestamps = first_lidar_time + t_rel
+
+        # Derive roll/pitch from FLIO gravity vector (sensor is ~20° nose-down;
+        # using IE anchor roll/pitch gives ~4 m/s² error, gravity gives ~0.4 m/s²).
+        grav_mean = np.mean(data[:, 22:25], axis=0)  # gravity in FLIO world frame
+        pitch_sensor_rad = math.atan2(-grav_mean[0], math.sqrt(grav_mean[1]**2 + grav_mean[2]**2))
+        roll_sensor_rad = math.atan2(grav_mean[1], -grav_mean[2])
+        R_enu_from_world = rotation_matrix_from_ie(
+            math.degrees(roll_sensor_rad),
+            math.degrees(pitch_sensor_rad),
+            anchor_ie_pose.heading_deg,
+        )
+        t_enu_origin = pose_enu_from_ie(anchor_ie_pose, ecef_origin, enu_from_ecef)
+
+        # ENU positions: rotate FAST-LIO2 world-frame positions into ENU then translate
+        pos_enu = (R_enu_from_world @ pos_world.T).T + t_enu_origin[None, :]
+
+        # Convert ENU → ECEF → geodetic for each frame
+        # ecef = ecef_origin + enu_from_ecef.T @ t_enu   (row-vector: t_enu @ enu_from_ecef)
+        ecef_pts = ecef_origin[None, :] + pos_enu @ enu_from_ecef
+        lats, lons, heights = zip(*[_ecef_to_geodetic(e) for e in ecef_pts])
+        self._lat = np.array(lats, dtype=np.float64)
+        self._lon = np.array(lons, dtype=np.float64)
+        self._h = np.array(heights, dtype=np.float64)
+
+        # Rotation per frame: R_enu_from_body = R_enu_from_world @ R_world_from_body
+        rolls, pitches, headings = [], [], []
+        for e in euler_deg:
+            R_wfb = _euler_zyx_to_matrix(e[0], e[1], e[2])
+            R_efb = R_enu_from_world @ R_wfb
+            ro, pi, he = _r_enu_from_body_to_ie_angles(R_efb)
+            rolls.append(ro)
+            pitches.append(pi)
+            headings.append(he)
+        self._roll = np.array(rolls, dtype=np.float64)
+        self._pitch = np.array(pitches, dtype=np.float64)
+        self._heading = np.array(headings, dtype=np.float64)
+
+        self.poses = [
+            IePose(
+                timestamp=float(self.timestamps[i]),
+                latitude_deg=float(self._lat[i]),
+                longitude_deg=float(self._lon[i]),
+                height_m=float(self._h[i]),
+                roll_deg=float(self._roll[i]),
+                pitch_deg=float(self._pitch[i]),
+                heading_deg=float(self._heading[i]),
+            )
+            for i in range(len(self.timestamps))
+        ]
+        self._timestamps_list = self.timestamps.tolist()
+        print(
+            f"[FlioProvider] loaded {len(self.poses)} frames from {mat_pre_path}\n"
+            f"  anchor t={anchor_ie_pose.timestamp:.3f}  heading={anchor_ie_pose.heading_deg:.2f}°\n"
+            f"  gravity-derived roll={math.degrees(roll_sensor_rad):.2f}°  "
+            f"pitch={math.degrees(pitch_sensor_rad):.2f}°  (grav_flio={grav_mean})\n"
+            f"  anchor ENU origin: {t_enu_origin}"
+        )
+
+    # --- same interface as IePoseProvider ---
+
+    def get_interpolated(self, timestamp):
+        if not self.poses:
+            return None
+        ts_list = self._timestamps_list
+        right = bisect.bisect_right(ts_list, float(timestamp))
+        left = max(0, min(len(self.poses) - 1, right - 1))
+        lp = self.poses[left]
+        if left + 1 >= len(self.poses):
+            return lp
+        rp = self.poses[left + 1]
+        dt = float(rp.timestamp - lp.timestamp)
+        if dt <= 1e-9:
+            return lp
+        alpha = float(np.clip((timestamp - lp.timestamp) / dt, 0.0, 1.0))
+        return IePose(
+            timestamp=float(timestamp),
+            latitude_deg=float(lp.latitude_deg + (rp.latitude_deg - lp.latitude_deg) * alpha),
+            longitude_deg=float(lp.longitude_deg + (rp.longitude_deg - lp.longitude_deg) * alpha),
+            height_m=float(lp.height_m + (rp.height_m - lp.height_m) * alpha),
+            roll_deg=lerp_angle_deg(lp.roll_deg, rp.roll_deg, alpha),
+            pitch_deg=lerp_angle_deg(lp.pitch_deg, rp.pitch_deg, alpha),
+            heading_deg=lerp_angle_deg(lp.heading_deg, rp.heading_deg, alpha),
+        )
+
+    def get_interpolated_batch(self, timestamps):
+        n = len(self.poses)
+        if n == 0:
+            return None
+        ts_arr = np.asarray(timestamps, dtype=np.float64)
+        ts_self = self.timestamps
+        right = np.searchsorted(ts_self, ts_arr, side="right")
+        left = np.clip(right - 1, 0, n - 1)
+        right = np.clip(right, 0, n - 1)
+        t_left = ts_self[left]
+        t_right = ts_self[right]
+        dt = t_right - t_left
+        alpha = np.where(dt > 1e-9, (ts_arr - t_left) / dt, 0.0)
+        alpha = np.clip(alpha, 0.0, 1.0)
+
+        def _lerp(a, b):
+            return a + alpha * (b - a)
+
+        def _lerp_ang(a, b):
+            d = (b - a + 180.0) % 360.0 - 180.0
+            return a + d * alpha
+
+        return {
+            "timestamp": ts_arr,
+            "latitude_deg": _lerp(self._lat[left], self._lat[right]),
+            "longitude_deg": _lerp(self._lon[left], self._lon[right]),
+            "height_m": _lerp(self._h[left], self._h[right]),
+            "roll_deg": _lerp_ang(self._roll[left], self._roll[right]),
+            "pitch_deg": _lerp_ang(self._pitch[left], self._pitch[right]),
+            "heading_deg": _lerp_ang(self._heading[left], self._heading[right]),
+        }
 
 
 def deg2rad(v):
@@ -180,6 +416,62 @@ def rotation_matrix_from_ie(roll_deg, pitch_deg, heading_deg):
     r_enu_from_rfu = r_rfu_from_enu.T
     r_rfu_from_flu = np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
     return r_enu_from_rfu @ r_rfu_from_flu
+
+
+def rotation_matrices_from_ie_batch(roll_deg, pitch_deg, heading_deg):
+    """Vectorized form of rotation_matrix_from_ie. Inputs are (n,) arrays;
+    returns an (n, 3, 3) array of R_enu_from_body matrices.
+    """
+    roll = np.deg2rad(np.asarray(roll_deg, dtype=np.float64))
+    pitch = np.deg2rad(np.asarray(pitch_deg, dtype=np.float64))
+    neg_az = -np.deg2rad(np.asarray(heading_deg, dtype=np.float64))
+    n = roll.shape[0]
+    cr, sr = np.cos(roll), np.sin(roll)
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    cz, sz = np.cos(neg_az), np.sin(neg_az)
+
+    Ry = np.zeros((n, 3, 3), dtype=np.float64)
+    Ry[:, 0, 0] = cr; Ry[:, 0, 2] = -sr
+    Ry[:, 1, 1] = 1.0
+    Ry[:, 2, 0] = sr; Ry[:, 2, 2] = cr
+
+    Rx = np.zeros((n, 3, 3), dtype=np.float64)
+    Rx[:, 0, 0] = 1.0
+    Rx[:, 1, 1] = cp; Rx[:, 1, 2] = sp
+    Rx[:, 2, 1] = -sp; Rx[:, 2, 2] = cp
+
+    Rz = np.zeros((n, 3, 3), dtype=np.float64)
+    Rz[:, 0, 0] = cz; Rz[:, 0, 1] = sz
+    Rz[:, 1, 0] = -sz; Rz[:, 1, 1] = cz
+    Rz[:, 2, 2] = 1.0
+
+    r_rfu_from_enu = Ry @ Rx @ Rz
+    r_enu_from_rfu = r_rfu_from_enu.transpose(0, 2, 1)
+    r_rfu_from_flu = np.array(
+        [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64
+    )
+    return r_enu_from_rfu @ r_rfu_from_flu
+
+
+def pose_enu_from_geodetic_batch(lat_deg, lon_deg, h_m, ecef_origin, enu_from_ecef):
+    """Vectorized geodetic_to_ecef + ENU rotation. Inputs are (n,) arrays;
+    returns (n, 3) ENU positions.
+    """
+    a = 6378137.0
+    e2 = 6.69437999014e-3
+    lat = np.deg2rad(np.asarray(lat_deg, dtype=np.float64))
+    lon = np.deg2rad(np.asarray(lon_deg, dtype=np.float64))
+    h = np.asarray(h_m, dtype=np.float64)
+    sin_lat = np.sin(lat); cos_lat = np.cos(lat)
+    sin_lon = np.sin(lon); cos_lon = np.cos(lon)
+    n_curve = a / np.sqrt(1.0 - e2 * sin_lat * sin_lat)
+    x = (n_curve + h) * cos_lat * cos_lon
+    y = (n_curve + h) * cos_lat * sin_lon
+    z = (n_curve * (1.0 - e2) + h) * sin_lat
+    ecef = np.stack([x, y, z], axis=-1)
+    # ENU = enu_from_ecef @ (ecef - origin); for row-vectors that's
+    # (ecef - origin) @ enu_from_ecef.T
+    return (ecef - ecef_origin[None, :]) @ enu_from_ecef.T
 
 
 def geodetic_to_ecef(lat_deg, lon_deg, h_m):
@@ -224,50 +516,64 @@ def ie_pose_to_quaternion_xyzw(ie_pose):
     return np.asarray(q, dtype=np.float64)
 
 
-# base<-lidar, copied from tracking project (FLU convention)
+# base<-lidar and base<-span, copied from /mnt/ning_602/work/tracking
+# (configs/lidar_config.yaml, ie_lidar_extrinsics block). base/body is FLU.
+# Tracking calibrates span as RFU (per the "FLU->RFU" comment in the YAML
+# and the SPAN convention used by NovAtel IE).
 R_BASE_FROM_LIDAR = np.array([[0.9063, 0.0, 0.4226], [0.0, 1.0, 0.0], [-0.4226, 0.0, 0.9063]], dtype=np.float64)
 T_BASE_FROM_LIDAR_M = np.array([0.0315, 0.0, 0.1314], dtype=np.float64)
-R_BASE_FROM_SPAN = np.array([[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]], dtype=np.float64)
-T_BASE_FROM_SPAN_M = np.array([-0.2684, -0.0820, -0.1527], dtype=np.float64)
-R_SPAN_FROM_BASE = R_BASE_FROM_SPAN.T
-T_SPAN_FROM_BASE_M = -R_SPAN_FROM_BASE @ T_BASE_FROM_SPAN_M
-R_SPAN_FROM_LIDAR = R_SPAN_FROM_BASE @ R_BASE_FROM_LIDAR
-T_SPAN_FROM_LIDAR_M = R_SPAN_FROM_BASE @ T_BASE_FROM_LIDAR_M + T_SPAN_FROM_BASE_M
-R_LIDAR_FROM_SPAN = R_SPAN_FROM_LIDAR.T
-T_LIDAR_FROM_SPAN_M = -R_LIDAR_FROM_SPAN @ T_SPAN_FROM_LIDAR_M
+R_BASE_FROM_SPAN = np.array([[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+T_BASE_FROM_SPAN_M = np.array([-0.1854, 0.0, -0.242], dtype=np.float64)
+R_LIDAR_FROM_BASE = R_BASE_FROM_LIDAR.T
+
+# Lidar position in the IE body frame (FLU axes, **origin at SPAN antenna**)
+# = base->lidar position minus base->span position. This matches both the
+# tracking project's chain `R_SPAN_FROM_LIDAR @ p + T_SPAN_FROM_LIDAR_M`
+# followed by FLU<-RFU axis swap, and the convention used by NovAtel IE
+# poses (the lat/lon/h reported by IE is the antenna position, so the
+# body origin must also be the antenna for `p_world = R @ p_body + t_enu`
+# to be self-consistent — see doc/coordinate_transforms.md).
+T_FLU_LIDAR_FROM_SPAN = T_BASE_FROM_LIDAR_M - T_BASE_FROM_SPAN_M
 
 
 def lidar_to_ie_body(points_lidar_xyz):
+    """LiDAR-frame xyz -> IE body-frame (FLU, origin at SPAN antenna).
+
+    Previously this hard-coded a `(x, -y, -z)` flip that assumed span was
+    FRD. After the 2026-04-29 rotation fix the rotation was right but the
+    body origin was at `base`, not `span`, leaving a constant ~30 cm
+    offset in every one-way `lidar -> world ENU` (since `t_enu` derived
+    from IE describes the SPAN antenna position). Tracking's body frame
+    is span-centered; we now match it via the explicit
+    `T_FLU_LIDAR_FROM_SPAN` translation.
+    """
     pts = np.asarray(points_lidar_xyz, dtype=np.float64)
-    p_span_frd = (R_SPAN_FROM_LIDAR @ pts.T).T + T_SPAN_FROM_LIDAR_M[None, :]
-    out = np.empty_like(p_span_frd)
-    out[:, 0] = p_span_frd[:, 0]
-    out[:, 1] = -p_span_frd[:, 1]
-    out[:, 2] = -p_span_frd[:, 2]
-    return out
+    return (R_BASE_FROM_LIDAR @ pts.T).T + T_FLU_LIDAR_FROM_SPAN[None, :]
 
 
 def ie_body_to_lidar(points_body_flu):
     pts = np.asarray(points_body_flu, dtype=np.float64)
-    p_span_frd = np.empty_like(pts)
-    p_span_frd[:, 0] = pts[:, 0]
-    p_span_frd[:, 1] = -pts[:, 1]
-    p_span_frd[:, 2] = -pts[:, 2]
-    return (R_LIDAR_FROM_SPAN @ p_span_frd.T).T + T_LIDAR_FROM_SPAN_M[None, :]
+    return (R_LIDAR_FROM_BASE @ (pts - T_FLU_LIDAR_FROM_SPAN[None, :]).T).T
 
 
 def livox_msg_to_points_with_meta(msg):
     if getattr(msg, "_type", "") != "livox_ros_driver2/CustomMsg":
         raise RuntimeError(f"Unsupported lidar msg type: {getattr(msg, '_type', '')}, expected livox_ros_driver2/CustomMsg")
-    point_count = len(msg.points)
-    points = np.empty((point_count, 4), dtype=np.float64)
-    offsets_s = np.empty((point_count,), dtype=np.float64)
-    for i, p in enumerate(msg.points):
-        points[i, 0] = float(p.x)
-        points[i, 1] = float(p.y)
-        points[i, 2] = float(p.z)
-        points[i, 3] = float(getattr(p, "reflectivity", 0.0))
-        offsets_s[i] = float(getattr(p, "offset_time", 0.0)) * 1e-9
+    pts_list = msg.points
+    n = len(pts_list)
+    if n == 0:
+        points = np.zeros((0, 4), dtype=np.float64)
+        offsets_s = np.zeros((0,), dtype=np.float64)
+    else:
+        # A single list comprehension + np.fromiter-style array build is
+        # ~2-3× faster than indexed assignment in a Python for-loop and
+        # produces fewer temporary objects, which keeps the GC quiet.
+        arr = np.array(
+            [(p.x, p.y, p.z, p.reflectivity, p.offset_time) for p in pts_list],
+            dtype=np.float64,
+        )
+        points = arr[:, :4]
+        offsets_s = arr[:, 4] * 1e-9
     base_ts = float(getattr(msg, "timebase", 0)) * 1e-9
     if base_ts <= 0.0:
         base_ts = float(msg.header.stamp.to_sec())
@@ -275,6 +581,24 @@ def livox_msg_to_points_with_meta(msg):
         "base_timestamp": base_ts,
         "points_xyzi": points,
         "offsets_s": offsets_s,
+    }
+
+
+def reduce_lidar_packet(packet, stride=1, max_points=0):
+    stride = max(int(stride), 1)
+    max_points = max(int(max_points), 0)
+    points = packet["points_xyzi"]
+    offsets = packet["offsets_s"]
+    if stride > 1:
+        points = points[::stride]
+        offsets = offsets[::stride]
+    if max_points > 0 and len(points) > max_points:
+        points = points[:max_points]
+        offsets = offsets[:max_points]
+    return {
+        "base_timestamp": packet["base_timestamp"],
+        "points_xyzi": points,
+        "offsets_s": offsets,
     }
 
 
@@ -302,15 +626,284 @@ def decode_image_msg(msg):
     raise RuntimeError(f"Unsupported image msg type: {msg_type}")
 
 
-def get_semantic_pcd(img, pcd_xyz, K, dismatrix, extrinsic, predictor):
-    rimg = cv2.undistort(img, K, dismatrix)
-    src = pcl2image(pcd_xyz, img.shape[1], img.shape[0], extrinsic)
-    cimg = predictor(rimg)
-    src[:, :, 2] = cimg
-    sem_pcdata = img2pcl(src)
+def message_stamp_sec(msg, fallback_stamp):
+    """Prefer sensor header time over rosbag record time.
+
+    The bag record stamp includes transport/recording latency. In this bag,
+    camera record stamps are about 24-29 ms after image header stamps, while
+    Livox timebase matches its header stamp. Mixing camera bag time with
+    lidar sensor time shifts the IE pose used for pkl generation.
+    """
+    header = getattr(msg, "header", None)
+    stamp = getattr(header, "stamp", None)
+    if stamp is not None:
+        try:
+            ts = float(stamp.to_sec())
+            if ts > 0.0:
+                return ts
+        except Exception:
+            pass
+    return float(fallback_stamp.to_sec())
+
+
+def project_lidar_to_class(
+    points_xyz_lidar,
+    class_image,
+    camera_matrix,
+    dist_coeffs,
+    rotation_lidar_from_camera,
+    translation_lidar_from_camera,
+    camera_model="pinhole",
+    min_depth=0.2,
+    class_max_depth=None,
+    zbuffer_px=0,
+):
+    """Project LiDAR points (in lidar frame) onto a class-id image and return
+    the per-point class assignment.
+
+    Mirrors the convention used by /mnt/ning_602/work/tracking
+    (`core/fusion_tracking.py:_project_lidar_points_to_image`):
+    target_frame stores `lidar_from_camera` so camera-frame points are
+    `R^T @ (p_lidar - t)`, then `cv2.fisheye.projectPoints` (equidistant) or
+    `cv2.projectPoints` (pinhole) projects them onto the raw image.
+
+    `class_max_depth` is an optional `{class_id: max_camera_z_meters}` map.
+    Points labeled with a class in the map whose camera-frame Z exceeds the
+    cap are relabeled to SEG_BACKGROUND_CLASS — far-field projection error
+    grows fast (a 2 mrad calibration residual is ~5 cm at 25 m), so we kill
+    the long-tail false positives at distance for the classes that suffer
+    most from boundary jitter.
+
+    `zbuffer_px` keeps only the nearest LiDAR point per projected pixel block
+    before class lookup. Without this visibility check, a farther point can be
+    labeled from a foreground semantic pixel and later reproject onto walls,
+    people, or railings in neighboring frames.
+
+    Returns (M, 4) float64: (x_lidar, y_lidar, z_lidar, class_id) for points
+    that landed inside the image.
+    """
+    points = np.asarray(points_xyz_lidar, dtype=np.float64)
+    if points.ndim == 2 and points.shape[1] >= 3:
+        points = points[:, :3]
+    else:
+        points = points.reshape(-1, 3)
+    if len(points) == 0:
+        return np.zeros((0, 4), dtype=np.float64)
+
+    R = np.asarray(rotation_lidar_from_camera, dtype=np.float64).reshape(3, 3)
+    t = np.asarray(translation_lidar_from_camera, dtype=np.float64).reshape(3)
+    K = np.asarray(camera_matrix, dtype=np.float64).reshape(3, 3)
+    D = np.asarray(dist_coeffs, dtype=np.float64).reshape(-1, 1)
+
+    points_camera = (R.T @ (points - t).T).T
+    front_mask = points_camera[:, 2] > float(min_depth)
+    if not front_mask.any():
+        return np.zeros((0, 4), dtype=np.float64)
+
+    front_idx = np.where(front_mask)[0]
+    front_pts = points_camera[front_mask].reshape(-1, 1, 3)
+    rvec = np.zeros((3, 1), dtype=np.float64)
+    tvec = np.zeros((3, 1), dtype=np.float64)
+    if str(camera_model).lower() == "equidistant":
+        img_pts, _ = cv2.fisheye.projectPoints(
+            objectPoints=front_pts, rvec=rvec, tvec=tvec, K=K, D=D,
+        )
+    else:
+        img_pts, _ = cv2.projectPoints(
+            objectPoints=front_pts, rvec=rvec, tvec=tvec,
+            cameraMatrix=K, distCoeffs=D,
+        )
+    pixels = img_pts.reshape(-1, 2)
+
+    cols = np.round(pixels[:, 0]).astype(np.int64)
+    rows = np.round(pixels[:, 1]).astype(np.int64)
+    h, w = class_image.shape[:2]
+    in_bounds = (cols >= 0) & (cols < w) & (rows >= 0) & (rows < h)
+    if not in_bounds.any():
+        return np.zeros((0, 4), dtype=np.float64)
+
+    keep_global = front_idx[in_bounds]
+    keep_cols = cols[in_bounds]
+    keep_rows = rows[in_bounds]
+    if int(zbuffer_px) > 0 and len(keep_global) > 0:
+        block = max(1, int(zbuffer_px))
+        block_cols = keep_cols // block
+        block_rows = keep_rows // block
+        block_ids = block_rows * ((w + block - 1) // block) + block_cols
+        order = np.lexsort((points_camera[keep_global, 2], block_ids))
+        sorted_blocks = block_ids[order]
+        first = np.r_[True, sorted_blocks[1:] != sorted_blocks[:-1]]
+        keep_local = order[first]
+        keep_global = keep_global[keep_local]
+        keep_cols = keep_cols[keep_local]
+        keep_rows = keep_rows[keep_local]
+    classes = class_image[keep_rows, keep_cols].astype(np.float64)
+
+    if class_max_depth:
+        kept_camera_z = points_camera[keep_global, 2]
+        for cls_id, max_z in class_max_depth.items():
+            far_mask = (classes == float(cls_id)) & (kept_camera_z > float(max_z))
+            if far_mask.any():
+                classes[far_mask] = float(SEG_BACKGROUND_CLASS)
+
+    out = np.empty((len(keep_global), 4), dtype=np.float64)
+    out[:, :3] = points[keep_global]
+    out[:, 3] = classes
+    return out
+
+
+SEG_BACKGROUND_CLASS = 0  # sentinel for "filtered-out small region";
+# class 0 ("bird" in mapillary) never appears in road scenes and is filtered
+# out downstream by any class-id whitelist (sidewalk=15, road=13, etc.).
+
+
+def filter_small_segments(class_image, min_pixels, classes_to_filter=None):
+    """Drop per-class connected components smaller than `min_pixels`.
+
+    Parameters
+    ----------
+    class_image : (H, W) uint8 array of class ids.
+    min_pixels  : int. Components with fewer pixels are replaced with
+                  `SEG_BACKGROUND_CLASS` (will not match any real class id
+                  during projection lookup).
+    classes_to_filter : iterable of int, or None. If None, all class ids
+                  present in the image are filtered. If a list, only those
+                  ids are filtered (others left untouched).
+    """
+    if min_pixels <= 0:
+        return class_image
+    out = class_image.copy()
+    if classes_to_filter is None:
+        classes_to_filter = [int(c) for c in np.unique(class_image)
+                             if c != SEG_BACKGROUND_CLASS]
+    for cid in classes_to_filter:
+        mask = (out == cid).astype(np.uint8)
+        if not mask.any():
+            continue
+        n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        for lbl in range(1, n_labels):  # 0 is background
+            if stats[lbl, cv2.CC_STAT_AREA] < min_pixels:
+                out[labels == lbl] = SEG_BACKGROUND_CLASS
+    return out
+
+
+def get_semantic_pcd(
+    img,
+    pcd_xyz_lidar,
+    camera_matrix,
+    dist_coeffs,
+    rotation_lidar_from_camera,
+    translation_lidar_from_camera,
+    camera_model,
+    predictor,
+    predict_image_scale=1.0,
+    min_segment_pixels=0,
+    seg_filter_classes=None,
+    class_erode_px=None,
+    class_max_depth=None,
+    zbuffer_px=0,
+    suppress_near_person_px=None,
+    person_class=19,
+):
+    """Run segmentation on the raw camera image and assign each in-FOV LiDAR
+    point the class id at its projected pixel.
+
+    The image is *not* undistorted before the segmenter runs; tracking's
+    pipeline operates on the raw fisheye image and we follow the same
+    convention so that `cv2.fisheye.projectPoints` lands at the same pixels
+    the segmenter actually saw.
+
+    `min_segment_pixels` (default 0 = off) discards per-class connected
+    components smaller than this many pixels — kills tiny mis-segmented
+    blobs before they get projected onto lidar points.
+    `seg_filter_classes` restricts the filter to specific class ids
+    (e.g. `[15]` to only clean sidewalk), or None to filter all classes.
+    """
+    predict_image_scale = float(predict_image_scale)
+    if predict_image_scale > 0.0 and abs(predict_image_scale - 1.0) > 1e-6:
+        small_w = max(1, int(round(img.shape[1] * predict_image_scale)))
+        small_h = max(1, int(round(img.shape[0] * predict_image_scale)))
+        pred_img = cv2.resize(img, (small_w, small_h), interpolation=cv2.INTER_LINEAR)
+        cimg_small = predictor(pred_img)
+        cimg = cv2.resize(cimg_small, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST)
+    else:
+        cimg = predictor(img)
+    if min_segment_pixels > 0:
+        cimg = filter_small_segments(cimg, int(min_segment_pixels), seg_filter_classes)
+    if class_erode_px:
+        # Inset selected class boundaries by N pixels before projection.
+        # Mask2Former boundaries have a 1-3 px uncertainty band that
+        # accumulates into a "false-curb strip" in the world cloud after
+        # 700+ frames. Eroding that band before sampling kills the
+        # boundary-jitter source. We overwrite to SEG_BACKGROUND_CLASS so
+        # downstream class-id whitelists ignore the eroded pixels.
+        for cls_id, erode_px in class_erode_px.items():
+            erode_px = int(erode_px)
+            if erode_px <= 0:
+                continue
+            mask = (cimg == int(cls_id)).astype(np.uint8)
+            if not mask.any():
+                continue
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2 * erode_px + 1, 2 * erode_px + 1))
+            eroded = cv2.erode(mask, kernel)
+            stripped = mask.astype(bool) & ~eroded.astype(bool)
+            if stripped.any():
+                cimg[stripped] = SEG_BACKGROUND_CLASS
+    if suppress_near_person_px:
+        # Mask2Former on Mapillary has a strong "person → sidewalk-under-feet"
+        # prior baked into the training distribution. Every visible pedestrian
+        # gets a ~25 px halo of sidewalk pixels around them regardless of what
+        # they're actually standing on. Accumulated across 700+ frames this
+        # paints sidewalk-class points on roads (under standing pedestrians)
+        # and across crosswalks (under walking pedestrians, forming the
+        # spurious sidewalk "bridge" that connects the two real sidewalks).
+        # Killing the halo at the source removes both artifacts cleanly.
+        person_mask = (cimg == int(person_class)).astype(np.uint8)
+        if person_mask.any():
+            for cls_id, radius in suppress_near_person_px.items():
+                radius = int(radius)
+                if radius <= 0:
+                    continue
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                                   (2 * radius + 1, 2 * radius + 1))
+                person_dil = cv2.dilate(person_mask, kernel).astype(bool)
+                suppress = (cimg == int(cls_id)) & person_dil
+                if suppress.any():
+                    cimg[suppress] = SEG_BACKGROUND_CLASS
+    sem_pcdata = project_lidar_to_class(
+        pcd_xyz_lidar,
+        cimg,
+        camera_matrix,
+        dist_coeffs,
+        rotation_lidar_from_camera,
+        translation_lidar_from_camera,
+        camera_model=camera_model,
+        class_max_depth=class_max_depth,
+        zbuffer_px=zbuffer_px,
+    )
     if len(sem_pcdata) == 0:
-        return np.array([]).reshape((0, 4)), cimg
+        return np.zeros((0, 4), dtype=np.float64), cimg
     return sem_pcdata, cimg
+
+
+def configure_cpu_runtime(cpu_threads):
+    cpu_threads = max(int(cpu_threads), 1)
+    os.environ["OMP_NUM_THREADS"] = str(cpu_threads)
+    os.environ["OPENBLAS_NUM_THREADS"] = str(cpu_threads)
+    os.environ["MKL_NUM_THREADS"] = str(cpu_threads)
+    os.environ["NUMEXPR_NUM_THREADS"] = str(cpu_threads)
+    try:
+        cv2.setNumThreads(cpu_threads)
+    except Exception:
+        pass
+    try:
+        import torch
+
+        torch.set_num_threads(cpu_threads)
+        if hasattr(torch, "set_num_interop_threads"):
+            torch.set_num_interop_threads(max(1, min(cpu_threads, 2)))
+    except Exception:
+        pass
 
 
 def _ie_pose_to_enu_transform(ie_pose, ecef_origin, enu_from_ecef):
@@ -320,19 +913,42 @@ def _ie_pose_to_enu_transform(ie_pose, ecef_origin, enu_from_ecef):
 
 
 def undistort_livox_points_to_base(points_xyzi, offsets_s, base_pose, ie_provider, ecef_origin, enu_from_ecef):
+    """Motion-compensate a livox packet so every point is expressed at the
+    packet's base timestamp.
+
+    This used to be a Python loop calling `ie_provider.get_interpolated`
+    once per point and building a fresh 3×3 rotation matrix per point;
+    at 12k pts × 10 Hz that's 120k pose lookups + matmuls per second in
+    Python and was the main reason the desktop felt frozen during
+    capture. Everything below is now numpy-vectorized.
+    """
     if len(points_xyzi) == 0:
         return points_xyzi
-    base_r_enu_from_body, base_t_enu = _ie_pose_to_enu_transform(base_pose, ecef_origin, enu_from_ecef)
     out = np.array(points_xyzi, dtype=np.float64, copy=True)
-    for idx, offset_s in enumerate(offsets_s.tolist()):
-        point_pose = ie_provider.get_interpolated(base_pose.timestamp + float(offset_s))
-        if point_pose is None:
-            continue
-        point_r_enu_from_body, point_t_enu = _ie_pose_to_enu_transform(point_pose, ecef_origin, enu_from_ecef)
-        point_body = lidar_to_ie_body(out[idx : idx + 1, :3])[0]
-        point_enu = point_r_enu_from_body @ point_body + point_t_enu
-        base_body = base_r_enu_from_body.T @ (point_enu - base_t_enu)
-        out[idx, :3] = ie_body_to_lidar(base_body.reshape(1, 3))[0]
+
+    t_pts = float(base_pose.timestamp) + np.asarray(offsets_s, dtype=np.float64)
+    interp = ie_provider.get_interpolated_batch(t_pts)
+    if interp is None:
+        return out
+
+    R_per = rotation_matrices_from_ie_batch(
+        interp["roll_deg"], interp["pitch_deg"], interp["heading_deg"]
+    )  # (n, 3, 3)
+    t_per = pose_enu_from_geodetic_batch(
+        interp["latitude_deg"], interp["longitude_deg"], interp["height_m"],
+        ecef_origin, enu_from_ecef,
+    )  # (n, 3)
+
+    base_r_enu_from_body, base_t_enu = _ie_pose_to_enu_transform(base_pose, ecef_origin, enu_from_ecef)
+
+    pts_body = (R_BASE_FROM_LIDAR @ out[:, :3].T).T + T_FLU_LIDAR_FROM_SPAN[None, :]
+    pts_enu = np.einsum("nij,nj->ni", R_per, pts_body) + t_per
+    # base_R^T @ (pts_enu - base_t)  ==  (pts_enu - base_t) @ base_R   (row-vector form)
+    pts_base_body = (pts_enu - base_t_enu[None, :]) @ base_r_enu_from_body
+    # R_LIDAR_FROM_BASE @ x  ==  x @ R_BASE_FROM_LIDAR                 (row-vector form)
+    pts_base_lidar = (pts_base_body - T_FLU_LIDAR_FROM_SPAN[None, :]) @ R_BASE_FROM_LIDAR
+
+    out[:, :3] = pts_base_lidar
     return out
 
 
@@ -398,6 +1014,9 @@ def main():
     parser.add_argument("-c", "--config", default="config/outdoor_config_livox_ie.json")
     parser.add_argument("-b", "--bag", default=None)
     parser.add_argument("--ie-txt", default=None, help="Path to IE txt such as 0421-AM-2026.txt")
+    parser.add_argument("--flio-mat-pre", default=None, help="Path to FAST-LIO2 mat_pre.txt (replaces IE for motion)")
+    parser.add_argument("--flio-first-lidar-time", default=None, type=float,
+                        help="Absolute Unix time of the first lidar frame (default: 1776743232.100252 for 0421-AM)")
     parser.add_argument("--camera-topic", default=None)
     parser.add_argument("--lidar-topic", default=None)
     parser.add_argument("-f", "--fastfoward", default=None, type=float)
@@ -405,6 +1024,10 @@ def main():
     parser.add_argument("--max-frames", default=None, type=int)
     parser.add_argument("--max-sync-dt", default=None, type=float, help="Max abs(camera_ts - lidar_ts) in seconds")
     parser.add_argument("--lidar-queue-size", default=None, type=int)
+    parser.add_argument("--cpu-threads", default=None, type=int)
+    parser.add_argument("--lidar-stride", default=None, type=int, help="Keep every Nth lidar point before processing.")
+    parser.add_argument("--max-lidar-points", default=None, type=int, help="Optional hard cap per lidar packet after stride.")
+    parser.add_argument("--predict-image-scale", default=None, type=float, help="Scale factor for segmentation inference image.")
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:
@@ -417,24 +1040,93 @@ def main():
     start_offset = args.fastfoward if args.fastfoward is not None else config.get("start_time", 0.0)
     duration = args.duration if args.duration is not None else config.get("play_time", -1)
     max_sync_dt = args.max_sync_dt if args.max_sync_dt is not None else float(config.get("max_sync_dt", 0.12))
-    lidar_queue_size = args.lidar_queue_size if args.lidar_queue_size is not None else int(config.get("lidar_queue_size", 300))
+    # Default lowered from 300 (30 s of raw lidar @ 10 Hz, ~120 MB) to 50
+    # (~5 s, ~20 MB). Image-vs-lidar sync windows are well under a second,
+    # so a 5 s buffer is more than enough; the old default was a memory
+    # liability on long bags and a contributor to the system stalling.
+    lidar_queue_size = args.lidar_queue_size if args.lidar_queue_size is not None else int(config.get("lidar_queue_size", 50))
+    cpu_threads = args.cpu_threads if args.cpu_threads is not None else int(config.get("cpu_threads", 2))
+    lidar_stride = args.lidar_stride if args.lidar_stride is not None else int(config.get("lidar_stride", 2))
+    max_lidar_points = args.max_lidar_points if args.max_lidar_points is not None else int(config.get("max_lidar_points", 0))
+    predict_image_scale = (
+        args.predict_image_scale if args.predict_image_scale is not None else float(config.get("predict_image_scale", 0.75))
+    )
+    min_segment_pixels = int(config.get("min_segment_pixels", 0))
+    seg_filter_classes = config.get("seg_filter_classes", None)
+    if seg_filter_classes is not None:
+        seg_filter_classes = [int(c) for c in seg_filter_classes]
+    # Per-class boundary erosion + far-field cutoff. Both keyed by class id
+    # so we can dial sidewalk/road/etc. independently. Defaults are tuned
+    # for sidewalk(15) on the 0421-AM bag (see: 2D seg looks clean but the
+    # 3D world cloud accumulates curb-edge jitter and far-field projection
+    # error into a false sidewalk-on-road strip).
+    sidewalk_class = int(config.get("sidewalk_class", 15))
+    class_erode_px = dict(config.get("class_erode_px", {sidewalk_class: 2}))
+    class_erode_px = {int(k): int(v) for k, v in class_erode_px.items()}
+    class_max_depth = dict(config.get("class_max_depth", {sidewalk_class: 25.0}))
+    class_max_depth = {int(k): float(v) for k, v in class_max_depth.items()}
+    suppress_near_person_px = dict(config.get(
+        "suppress_near_person_px", {sidewalk_class: 25}))
+    suppress_near_person_px = {int(k): int(v) for k, v in suppress_near_person_px.items()}
+    person_class = int(config.get("person_class", 19))
+    projection_zbuffer_px = int(config.get("projection_zbuffer_px", 3))
     road_class = config.get("road_class", 13)
 
     color_classes = get_colors(config["cmap"])
-    K = np.asarray(config["intrinsic"], dtype=np.float64)
-    extrinsic = np.asarray(config["extrinsic"], dtype=np.float64)
-    dismatrix = np.asarray(config["distortion_matrix"], dtype=np.float64)
+    camera_matrix = np.asarray(config["intrinsic"], dtype=np.float64)
+    dist_coeffs = np.asarray(config["distortion_matrix"], dtype=np.float64)
+    camera_model = str(config.get("camera_model", "pinhole")).lower()
+    if camera_model in {"equidistantcamera", "fisheye"}:
+        camera_model = "equidistant"
+    if camera_model not in {"pinhole", "equidistant"}:
+        raise ValueError(f"Unsupported camera_model in config: {config.get('camera_model')!r}")
+
+    # Tracking project's `target_frame` block stores `lidar_from_camera` as
+    # the rotation/translation pair used to transform a camera-frame point
+    # into the lidar (target) frame. We accept either that direct form via
+    # `lidar_from_camera_*` keys, or fall back to deriving it from the
+    # legacy 4x4 `extrinsic` (camera_from_lidar) when the new keys are absent.
+    if "lidar_from_camera_rotation" in config and "lidar_from_camera_translation" in config:
+        rotation_lidar_from_camera = np.asarray(config["lidar_from_camera_rotation"], dtype=np.float64).reshape(3, 3)
+        translation_lidar_from_camera = np.asarray(config["lidar_from_camera_translation"], dtype=np.float64).reshape(3)
+    else:
+        legacy = np.asarray(config["extrinsic"], dtype=np.float64).reshape(4, 4)
+        R_camera_from_lidar = legacy[:3, :3]
+        t_camera_from_lidar = legacy[:3, 3]
+        rotation_lidar_from_camera = R_camera_from_lidar.T
+        translation_lidar_from_camera = -R_camera_from_lidar.T @ t_camera_from_lidar
     colors = color_classes.astype("uint8")
 
+    configure_cpu_runtime(cpu_threads)
     signal.signal(signal.SIGINT, handle_termination_signal)
     signal.signal(signal.SIGTERM, handle_termination_signal)
+    # Lower scheduling priority so the GUI/IDE stays responsive even when
+    # the model + lidar pipeline pegs CPU. Best-effort; not all platforms
+    # allow this without privileges.
+    try:
+        os.nice(10)
+    except (OSError, AttributeError):
+        pass
 
     poses = load_ie_poses(ie_txt)
     if not poses:
         raise RuntimeError(f"No IE pose rows parsed from {ie_txt}")
-    ie_provider = IePoseProvider(poses)
     ecef_origin = geodetic_to_ecef(poses[0].latitude_deg, poses[0].longitude_deg, poses[0].height_m)
     enu_from_ecef = ecef_to_enu_matrix(poses[0].latitude_deg, poses[0].longitude_deg)
+
+    flio_mat_pre = args.flio_mat_pre if args.flio_mat_pre is not None else config.get("flio_mat_pre", None)
+    if flio_mat_pre:
+        first_lidar_time = (
+            args.flio_first_lidar_time
+            if args.flio_first_lidar_time is not None
+            else float(config.get("flio_first_lidar_time", 1776743232.100252))
+        )
+        # Use the IE pose at first_lidar_time as the anchor for absolute position
+        ie_tmp = IePoseProvider(poses)
+        anchor_pose = ie_tmp.get_interpolated(first_lidar_time)
+        ie_provider = FlioProvider(flio_mat_pre, first_lidar_time, anchor_pose, ecef_origin, enu_from_ecef)
+    else:
+        ie_provider = IePoseProvider(poses)
 
     rospy.init_node("fix_distortion", anonymous=False, log_level=rospy.DEBUG, disable_signals=True)
     fixCloudPubHandle = rospy.Publisher("dedistortion_cloud", PointCloud2, queue_size=5)
@@ -451,8 +1143,10 @@ def main():
 
     bag = None
     store_file = None
+    road_chunks_file = None
+    road_chunks_path = None
     pose_save = []
-    road_save = []
+    road_chunk_count = 0
     index = 0
     msg_total = 0
     msg_lidar = 0
@@ -473,6 +1167,11 @@ def main():
         cmkdir(config["save_folder"] + "/originpics")
         cmkdir(config["save_folder"] + "/sempics")
         store_file = open(config["save_folder"] + "/outdoor.pkl", "wb")
+        # Stream road-class points to a chunks file instead of holding the
+        # whole-run list in memory (was ~1.6 GB resident on the 21-min bag).
+        # Reassembled into road.pcd in `finally` only if RAM allows.
+        road_chunks_path = config["save_folder"] + "/road_chunks.pkl"
+        road_chunks_file = open(road_chunks_path, "wb")
 
         for topic, msg, stamp in bagread:
             if STOP_REQUESTED or STOP_AFTER_MAX_FRAMES or rospy.is_shutdown():
@@ -486,6 +1185,7 @@ def main():
                 except Exception as e:
                     print(f"skip lidar frame at {ts:.3f}: {e}")
                     continue
+                packet = reduce_lidar_packet(packet, stride=lidar_stride, max_points=max_lidar_points)
                 base_ts = float(packet["base_timestamp"])
                 lidar_pose = ie_provider.get_interpolated(base_ts)
                 if lidar_pose is None:
@@ -501,7 +1201,7 @@ def main():
                 lidar_queue.append({"timestamp": base_ts, "points_xyzi": undistorted_xyzi})
             elif topic == camera_topic:
                 msg_camera += 1
-                image_queue.append((ts, msg))
+                image_queue.append((message_stamp_sec(msg, stamp), msg))
             else:
                 continue
 
@@ -552,7 +1252,24 @@ def main():
                 imgPubHandle.publish(bri.cv2_to_imgmsg(img))
                 cv2.imwrite(config["save_folder"] + "/originpics/%06d.png" % index, img)
 
-                sem_pcd_lidar, semimg = get_semantic_pcd(img, align_pcd, K, dismatrix, extrinsic, predictor)
+                sem_pcd_lidar, semimg = get_semantic_pcd(
+                    img,
+                    align_pcd,
+                    camera_matrix,
+                    dist_coeffs,
+                    rotation_lidar_from_camera,
+                    translation_lidar_from_camera,
+                    camera_model,
+                    predictor,
+                    predict_image_scale=predict_image_scale,
+                    min_segment_pixels=min_segment_pixels,
+                    seg_filter_classes=seg_filter_classes,
+                    class_erode_px=class_erode_px,
+                    class_max_depth=class_max_depth,
+                    zbuffer_px=projection_zbuffer_px,
+                    suppress_near_person_px=suppress_near_person_px,
+                    person_class=person_class,
+                )
                 cv2.imwrite(config["save_folder"] + "/sempics/%06d.png" % index, semimg)
                 semimg_vis = colors[semimg.flatten()].reshape((*semimg.shape, 3))
                 semimgPubHandle.publish(bri.cv2_to_imgmsg(semimg_vis, "bgr8"))
@@ -567,7 +1284,8 @@ def main():
                     semanticCloudPubHandle.publish(sem_msg)
                     road_world_pcd = sem_world_pcd[sem_world_pcd[:, 3] == road_class]
                     if len(road_world_pcd) != 0:
-                        road_save.append(road_world_pcd)
+                        pickle.dump(road_world_pcd, road_chunks_file)
+                        road_chunk_count += 1
                         road_msg = get_rgba_pcd_msg(road_world_pcd)
                         road_msg.header.frame_id = "world"
                         roadCloudPubHandle.publish(road_msg)
@@ -583,12 +1301,36 @@ def main():
     finally:
         if store_file is not None:
             store_file.close()
+        if road_chunks_file is not None:
+            road_chunks_file.close()
         if bag is not None:
             bag.close()
         pose_array = np.stack(pose_save) if len(pose_save) != 0 else np.empty((0, 7))
         np.savetxt(config["save_folder"] + "/pose.csv", pose_array, delimiter=",")
-        if len(road_save) != 0:
-            save_nppc(np.vstack(road_save), config["save_folder"] + "/road.pcd")
+        if road_chunks_path is not None and road_chunk_count > 0:
+            try:
+                chunks = []
+                with open(road_chunks_path, "rb") as rf:
+                    while True:
+                        try:
+                            chunks.append(pickle.load(rf))
+                        except EOFError:
+                            break
+                if chunks:
+                    save_nppc(np.vstack(chunks), config["save_folder"] + "/road.pcd")
+                # Reassembly succeeded; the chunks file is redundant.
+                try:
+                    os.remove(road_chunks_path)
+                except OSError:
+                    pass
+            except (MemoryError, Exception) as e:
+                # Keep the chunks file around so the user can reassemble
+                # offline (e.g. via tools/save_semantic_pcd.py with
+                # --keep-classes <road_class>).
+                print(
+                    f"warning: failed to write road.pcd ({e!r}); "
+                    f"chunks preserved at {road_chunks_path}"
+                )
         if STOP_REASON:
             print(f"exit: {STOP_REASON}")
         print(

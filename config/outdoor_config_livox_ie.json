@@ -1,6 +1,6 @@
 {
-    "bag_file": "data/outdoor/segment_2026-04-21-11-47-12_1.bag",
-    "ie_txt": "data/outdoor/0421-AM-2026.txt",
+    "bag_file": "data/0421-AM/segment_2026-04-21-11-47-12_1.bag",
+    "ie_txt": "data/0421-AM/0421-AM-2026.txt",
     "start_time": 0,
     "play_time": -1,
     "LiDAR_topic": "/lidar",
@@ -8,18 +8,22 @@
     "image_compressed": true,
     "max_sync_dt": 0.12,
     "lidar_queue_size": 300,
-    "extrinsic": [
-        [1.0102, -0.0026, -0.0087, 0.1135],
-        [-0.0033, -0.0030, -0.9963, -0.1617],
-        [0.0049, 0.9962, -0.0287, 0.0516],
-        [0.0000, 0.0000, 0.0000, 1.0000]
-    ],
+    "cpu_threads": 2,
+    "lidar_stride": 2,
+    "predict_image_scale": 0.75,
+    "camera_model": "equidistant",
     "intrinsic": [
-        [543.5046, 0, 630.7183],
-        [0, 540.5383, 350.9063],
-        [0, 0, 1]
+        [464.8906509662917, 0.0, 631.6777733624097],
+        [0.0, 465.0582538242402, 523.4363256680425],
+        [0.0, 0.0, 1.0]
     ],
-    "distortion_matrix": [-1.05873889e-01, 1.32265629e-01, -8.55667814e-05, -1.04098281e-03, -7.01241428e-02],
+    "distortion_matrix": [-0.017366953282639, 0.000574174219028, -0.00154438708609, 0.000549409825028],
+    "lidar_from_camera_rotation": [
+        [-0.0248760658442102,  0.4141228407617354,  0.9098810109610734],
+        [-0.9996892397064623, -0.008835361707340894, -0.0233100922052239],
+        [-0.001614113759963343, -0.9101781194595544,  0.4142139368657687]
+    ],
+    "lidar_from_camera_translation": [0.051401176491, 0.015593452288, -0.06077996213],
     "save_folder": "result/outdoor",
     "mode": "outdoor",
     "model_config": "imseg/mask2former/config/swin/maskformer2_swin_large_IN21k_384_bs16_300k.yaml",
@@ -32,5 +36,14 @@
     "vector": true,
     "vector_process": "road",
     "predict_func": "get_predict_func_detectron",
-    "cmap": "mapillary"
+    "cmap": "mapillary",
+    "min_segment_pixels": 500,
+    "seg_filter_classes": [13, 15, 23],
+    "class_erode_px": {"15": 2},
+    "class_max_depth": {"15": 25.0},
+    "suppress_near_person_px": {"15": 25},
+    "person_class": 19,
+    "sidewalk_pairwise_merge_min_overlap_ratio": 0.02,
+    "sidewalk_outline_alpha": 2.0,
+    "sidewalk_cluster_min_area": 3.0
 }

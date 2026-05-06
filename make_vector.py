@@ -24,6 +24,11 @@ def parse_args():
     parser.add_argument("--output", default=None, help="Output JSON path for vector records")
     parser.add_argument("--max_index", "--max-index", dest="max_index", default=10000, type=int, help="Max logical index to process")
     parser.add_argument("--start_index", "--start-index", dest="start_index", default=None, type=int, help="Start processing from this logical frame index")
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Skip per-frame ROS publishing + debug image saves; the largest perf win when batch-processing without rviz attached.",
+    )
     return parser.parse_args()
 
 

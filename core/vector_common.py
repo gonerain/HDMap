@@ -151,7 +151,7 @@ def cluster_labels(points_xy, eps, min_samples):
         return np.full((0,), -1, dtype=np.int32)
     if len(points_xy) < min_samples:
         return np.zeros((len(points_xy),), dtype=np.int32)
-    return DBSCAN(eps=eps, min_samples=min_samples).fit_predict(points_xy).astype(np.int32)
+    return DBSCAN(eps=eps, min_samples=min_samples, n_jobs=-1).fit_predict(points_xy).astype(np.int32)
 
 
 def fit_edge_segment_from_points(points_xy, axis):
@@ -387,32 +387,45 @@ class RuntimeContext:
         self.args = args
         self.config = config
         self.color_classes = get_colors(config["cmap"])
-        self.bri = CvBridge()
-        self.br = tf.TransformBroadcaster()
+        # Offline mode skips ROS publishing + per-frame imread; on the
+        # 200-frame test pkl this was 48% of make_vector wall time.
+        self.offline = bool(getattr(args, "offline", False) or config.get("offline", False))
+        if self.offline:
+            self.bri = None
+            self.br = None
+            self.semantic_cloud_pub = None
+            self.semimg_pub = None
+            self.img_pub = None
+        else:
+            self.bri = CvBridge()
+            self.br = tf.TransformBroadcaster()
+            rospy.init_node("make_vector", anonymous=False, log_level=rospy.DEBUG, disable_signals=True)
+            self.semantic_cloud_pub = rospy.Publisher("SemanticCloud", PointCloud2, queue_size=5)
+            self.semimg_pub = rospy.Publisher("SemanticImg", Image, queue_size=5)
+            self.img_pub = rospy.Publisher("Img", Image, queue_size=5)
 
-        rospy.init_node("make_vector", anonymous=False, log_level=rospy.DEBUG, disable_signals=True)
-        self.semantic_cloud_pub = rospy.Publisher("SemanticCloud", PointCloud2, queue_size=5)
-        self.semimg_pub = rospy.Publisher("SemanticImg", Image, queue_size=5)
-        self.img_pub = rospy.Publisher("Img", Image, queue_size=5)
-
-        if args.semantic:
+        if args.semantic and not self.offline:
             self.simgs = sorted(glob.glob(args.semantic + "/*"))
             self.colors = self.color_classes.astype("uint8")
         else:
             self.simgs = []
             self.colors = None
 
-        if args.origin:
+        if args.origin and not self.offline:
             self.imgs = sorted(glob.glob(args.origin + "/*"))
         else:
             self.imgs = []
 
-        if args.trajectory:
+        if args.trajectory and os.path.exists(args.trajectory):
             self.poses = np.loadtxt(args.trajectory, delimiter=",")
         else:
+            if args.trajectory:
+                print(f"trajectory file not found: {args.trajectory} (continuing without pose)")
             self.poses = None
 
     def publish_frame(self, frame_index, sempcd):
+        if self.offline:
+            return
         display_pcd = sempcd
         if self.args.filters:
             display_pcd = display_pcd[np.in1d(display_pcd[:, 3], self.args.filters)]
@@ -430,6 +443,8 @@ class RuntimeContext:
             self.img_pub.publish(self.bri.cv2_to_imgmsg(cv2.imread(self.imgs[frame_index]), "bgr8"))
 
     def publish_pose(self, frame_index):
+        if self.offline or self.br is None:
+            return
         if self.poses is None or frame_index >= len(self.poses):
             return
         pose = self.poses[frame_index]
@@ -563,12 +578,21 @@ class VectorProcess(ABC):
         cv2.putText(canvas, "last", (last_pt[0] + 12, last_pt[1] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 140, 0), 2)
         return canvas, to_canvas
 
+    def _debug_images_enabled(self):
+        if bool(getattr(self.args, "offline", False) or self.config.get("offline", False)):
+            return bool(self.config.get("debug_images", False))
+        return bool(self.config.get("debug_images", True))
+
     def save_debug_canvas(self, logical_index, canvas):
+        if not self._debug_images_enabled():
+            return
         debug_dir = self.config.get("debug_output_dir", default_demo_output_dir(self.name))
         os.makedirs(debug_dir, exist_ok=True)
         cv2.imwrite(os.path.join(debug_dir, f"{self.name}_centroid_debug_{logical_index:06d}.png"), canvas)
 
     def save_origin_debug_image(self, runtime, frame_index, logical_index):
+        if not self._debug_images_enabled():
+            return
         if not runtime.imgs or frame_index < 0 or frame_index >= len(runtime.imgs):
             return
         image = cv2.imread(runtime.imgs[frame_index])

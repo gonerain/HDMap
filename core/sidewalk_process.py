@@ -6,6 +6,7 @@ import cv2
 import numpy as np
 from shapely.geometry import MultiPolygon, Polygon
 
+from core.vector_common import FixedQueue
 from core.vector_common import VectorProcess
 from core.vector_common import cluster_labels
 from core.vector_common import extract_outline_by_alphashape
@@ -29,12 +30,37 @@ class SidewalkEdgeProcess(VectorProcess):
     cluster_min_samples = 12
     outline_alpha = 1.0
     merge_overlap_buffer = 0.2
-    fused_outline_simplify_tol = 0.25
-    fused_outline_smooth_iterations = 1
+    fused_outline_simplify_tol = 0.3
+    fused_outline_smooth_iterations = 2
     fused_outline_min_seg_len = 0.35
     fused_outline_post_simplify_tol = 0.12
+    # Vector-space morphological regularization is OFF by default. close
+    # bridges gaps between disjoint sidewalk segments along the trajectory,
+    # so the polygon balloons over the actual point footprint; open eats
+    # small polygons. Both run only when the user opts in via config.
+    fused_outline_close_buffer = 0.0
+    fused_outline_open_buffer = 0.0
     fused_min_area = 2.0
     fused_min_support_frames = 3
+    bev_res = 0.15
+    bev_min_frames = 3
+    bev_min_sidewalk_fraction = 0.5
+    bev_grid_cap = 4_000_000
+    # Default back to the 803a0e1 alpha-shape pipeline. The BEV temporal-vote
+    # path was a regression on the 0421-AM bag (polygons shrink below the
+    # actual sidewalk extent) — restore the older, simpler chain as the
+    # default and keep the BEV code reachable behind explicit config flags.
+    outline_method = "alpha"
+    outline_bev_res = 0.15
+    outline_bev_dilate_px = 1
+    use_bev_vote = False
+    # Voxel-downsample the per-cluster point set before alpha-shape. With the
+    # body-origin fix the per-frame sidewalk class is dense (~1.5k pts/frame
+    # × 10-frame window → 5k-15k pts per cluster), and alphashape on raw
+    # input is the dominant per-frame cost. 0.15m preserves the polygon
+    # envelope (cluster_eps=0.8 is much larger) while cutting input ~10x.
+    alpha_input_voxel = 0.15
+    alpha_input_max_points = 4000
 
     def __init__(self, args, config):
         super().__init__(args, config)
@@ -47,6 +73,233 @@ class SidewalkEdgeProcess(VectorProcess):
         self.min_cluster_density = float(config.get("sidewalk_cluster_min_density", 0.35))
         self.min_compactness = float(config.get("sidewalk_cluster_min_compactness", 0.004))
         self.max_center_distance = float(config.get("sidewalk_cluster_max_center_distance", 45.0))
+
+        # Phase A.2: BEV temporal voting on the sliding window of full-class
+        # point clouds. A cell becomes a "stable sidewalk cell" only when at
+        # least `bev_min_frames` distinct frames in the window saw sidewalk
+        # there AND the per-cell sidewalk fraction (sidewalk-frames /
+        # any-class-frames) is at least `bev_min_sidewalk_fraction`. The
+        # representative point per cell is its center with the mean Z of the
+        # contributing sidewalk hits. See doc/sidewalk_vectorization_roadmap.md.
+        self.bev_res = float(config.get("sidewalk_bev_res", self.bev_res))
+        self.bev_min_frames = max(int(config.get("sidewalk_bev_min_frames", self.bev_min_frames)), 1)
+        self.bev_min_sidewalk_fraction = float(
+            config.get("sidewalk_bev_min_sidewalk_fraction", self.bev_min_sidewalk_fraction)
+        )
+        self.bev_grid_cap = max(int(config.get("sidewalk_bev_grid_cap", self.bev_grid_cap)), 10_000)
+        self.full_history = FixedQueue(2 * self.dirc_window + self.window_size)
+
+        # Phase 1.1: BEV-contour outline replaces alpha-shape. Both the
+        # per-frame outline and the per-track final outline use this. Set
+        # `sidewalk_outline_method = "alpha"` to fall back to alphashape
+        # for A/B comparison.
+        self.outline_method = str(config.get("sidewalk_outline_method", self.outline_method)).lower()
+        if self.outline_method not in {"bev", "alpha"}:
+            raise ValueError(f"sidewalk_outline_method must be 'bev' or 'alpha', got {self.outline_method!r}")
+        self.outline_bev_res = float(config.get("sidewalk_outline_bev_res", self.outline_bev_res))
+        self.outline_bev_dilate_px = max(int(config.get("sidewalk_outline_bev_dilate_px", self.outline_bev_dilate_px)), 0)
+        self.use_bev_vote = bool(config.get("sidewalk_use_bev_vote", self.use_bev_vote))
+        self.alpha_input_voxel = float(config.get("sidewalk_alpha_input_voxel", self.alpha_input_voxel))
+        self.alpha_input_max_points = max(int(config.get("sidewalk_alpha_input_max_points", self.alpha_input_max_points)), 0)
+
+    def ingest_frame(self, sempcd):
+        # Base class drops everything but the target class; Phase A.2 needs
+        # the *full* per-frame cloud so the BEV vote can compute the per-cell
+        # sidewalk fraction. Keep both queues in lockstep so window slicing
+        # in process() lines up with the base class context — but only when
+        # BEV voting is on. Otherwise full_history just burns RAM and
+        # per-frame copies (~50 frames × full cloud each).
+        if sempcd is None or len(sempcd) == 0:
+            empty = np.zeros((0, 4), dtype=np.float32)
+            self.history.append(empty)
+            if self.use_bev_vote:
+                self.full_history.append(empty)
+            return
+        sempcd = np.asarray(sempcd, dtype=np.float32)
+        self.history.append(sempcd[sempcd[:, 3] == self.target_class])
+        if self.use_bev_vote:
+            self.full_history.append(sempcd)
+
+    def _bev_temporal_vote(self, full_frames):
+        """Reduce a temporal window of full-class point clouds to one
+        representative point per stable sidewalk cell.
+
+        A cell is kept iff:
+          * sidewalk_frame_count[cell] >= self.bev_min_frames
+          * sidewalk_frame_count[cell] / total_frame_count[cell]
+            >= self.bev_min_sidewalk_fraction
+
+        Returns an (M, 3) float32 array of (x, y, mean_sidewalk_z).
+        """
+        sidewalk_class = int(self.target_class)
+        non_empty = [np.asarray(f, dtype=np.float32) for f in full_frames if len(f) > 0]
+        if not non_empty:
+            return np.zeros((0, 3), dtype=np.float32)
+
+        all_xy = np.concatenate([f[:, :2] for f in non_empty], axis=0)
+        if len(all_xy) == 0:
+            return np.zeros((0, 3), dtype=np.float32)
+
+        res = float(self.bev_res)
+        if res <= 0.0:
+            return np.zeros((0, 3), dtype=np.float32)
+
+        xy_min = all_xy.min(axis=0).astype(np.float64)
+        xy_max = all_xy.max(axis=0).astype(np.float64)
+        grid_w = int(np.ceil((xy_max[0] - xy_min[0]) / res)) + 1
+        grid_h = int(np.ceil((xy_max[1] - xy_min[1]) / res)) + 1
+        if grid_w <= 0 or grid_h <= 0 or grid_w * grid_h > self.bev_grid_cap:
+            # Degenerate or pathological window — fall back to raw sidewalk
+            # points so we never silently drop a frame.
+            sidewalk_pts = [f[f[:, 3] == sidewalk_class, :3] for f in non_empty]
+            sidewalk_pts = [p for p in sidewalk_pts if len(p) > 0]
+            if not sidewalk_pts:
+                return np.zeros((0, 3), dtype=np.float32)
+            return np.vstack(sidewalk_pts).astype(np.float32, copy=False)
+
+        sidewalk_frame_count = np.zeros((grid_h, grid_w), dtype=np.int32)
+        total_frame_count = np.zeros((grid_h, grid_w), dtype=np.int32)
+        z_sum = np.zeros((grid_h, grid_w), dtype=np.float64)
+        z_count = np.zeros((grid_h, grid_w), dtype=np.int32)
+
+        for frame in non_empty:
+            col_all = ((frame[:, 0].astype(np.float64) - xy_min[0]) / res).astype(np.int64)
+            row_all = ((frame[:, 1].astype(np.float64) - xy_min[1]) / res).astype(np.int64)
+            np.clip(col_all, 0, grid_w - 1, out=col_all)
+            np.clip(row_all, 0, grid_h - 1, out=row_all)
+
+            cell_all = row_all * grid_w + col_all
+            unique_all = np.unique(cell_all)
+            ur = (unique_all // grid_w).astype(np.int32)
+            uc = (unique_all % grid_w).astype(np.int32)
+            total_frame_count[ur, uc] += 1
+
+            mask_sw = frame[:, 3] == sidewalk_class
+            if not mask_sw.any():
+                continue
+            cell_sw = cell_all[mask_sw]
+            unique_sw = np.unique(cell_sw)
+            sr = (unique_sw // grid_w).astype(np.int32)
+            sc = (unique_sw % grid_w).astype(np.int32)
+            sidewalk_frame_count[sr, sc] += 1
+
+            sw_pts = frame[mask_sw]
+            sw_row = row_all[mask_sw].astype(np.int32)
+            sw_col = col_all[mask_sw].astype(np.int32)
+            np.add.at(z_sum, (sw_row, sw_col), sw_pts[:, 2].astype(np.float64))
+            np.add.at(z_count, (sw_row, sw_col), 1)
+
+        if not (sidewalk_frame_count > 0).any():
+            return np.zeros((0, 3), dtype=np.float32)
+
+        with np.errstate(invalid="ignore", divide="ignore"):
+            fraction = np.where(
+                total_frame_count > 0,
+                sidewalk_frame_count / np.maximum(total_frame_count, 1),
+                0.0,
+            )
+
+        keep = (sidewalk_frame_count >= int(self.bev_min_frames)) & (
+            fraction >= float(self.bev_min_sidewalk_fraction)
+        )
+        if not keep.any():
+            return np.zeros((0, 3), dtype=np.float32)
+
+        rows, cols = np.where(keep)
+        z_safe = z_count[rows, cols]
+        cz = np.where(z_safe > 0, z_sum[rows, cols] / np.maximum(z_safe, 1), 0.0)
+        cx = (cols.astype(np.float64) + 0.5) * res + xy_min[0]
+        cy = (rows.astype(np.float64) + 0.5) * res + xy_min[1]
+        return np.column_stack([cx, cy, cz]).astype(np.float32)
+
+    def _extract_outline_bev(self, points_xyz):
+        """Outline extraction for the voted-cell point sets produced by A.2.
+
+        Rasterize cells into a BEV occupancy grid, morphologically close
+        gaps up to ~cluster_eps (DBSCAN already grouped within that
+        radius), then take the largest external contour. Hits the right
+        area envelope without the per-call O(N^2) work of alpha-shape.
+        """
+        pts = np.asarray(points_xyz, dtype=np.float32)
+        if len(pts) < 3:
+            return np.zeros((0, 2), dtype=np.float32)
+
+        res = float(self.outline_bev_res)
+        if res <= 0.0:
+            return np.zeros((0, 2), dtype=np.float32)
+
+        # Bridge gaps up to `cluster_eps`: DBSCAN already grouped cells
+        # within that radius into one cluster, so the morph close should
+        # be at least that wide to keep them connected in BEV.
+        dilate = max(int(self.outline_bev_dilate_px), int(np.ceil(self.cluster_eps / max(res, 1e-3) / 2.0)))
+
+        xy = pts[:, :2]
+        margin = res * (1 + dilate + 1)
+        xy_min = xy.min(axis=0) - margin
+        xy_max = xy.max(axis=0) + margin
+        grid_w = int(np.ceil((xy_max[0] - xy_min[0]) / res)) + 1
+        grid_h = int(np.ceil((xy_max[1] - xy_min[1]) / res)) + 1
+        if grid_w <= 0 or grid_h <= 0 or grid_w * grid_h > self.bev_grid_cap:
+            return np.zeros((0, 2), dtype=np.float32)
+
+        cols = ((xy[:, 0] - xy_min[0]) / res).astype(np.int32)
+        rows = ((xy[:, 1] - xy_min[1]) / res).astype(np.int32)
+        np.clip(cols, 0, grid_w - 1, out=cols)
+        np.clip(rows, 0, grid_h - 1, out=rows)
+
+        mask = np.zeros((grid_h, grid_w), dtype=np.uint8)
+        mask[rows, cols] = 255
+        if dilate > 0:
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * dilate + 1, 2 * dilate + 1))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return np.zeros((0, 2), dtype=np.float32)
+        contour = max(contours, key=cv2.contourArea)
+        if len(contour) < 3:
+            return np.zeros((0, 2), dtype=np.float32)
+
+        cnt = contour.reshape(-1, 2).astype(np.float32)
+        outline = np.empty_like(cnt)
+        outline[:, 0] = (cnt[:, 0] + 0.5) * res + xy_min[0]
+        outline[:, 1] = (cnt[:, 1] + 0.5) * res + xy_min[1]
+        if not np.allclose(outline[0], outline[-1]):
+            outline = np.vstack((outline, outline[:1])).astype(np.float32, copy=False)
+        return outline
+
+    def _voxel_downsample_xyz(self, points_xyz):
+        """2D voxel downsample to cap alphashape input size.
+
+        alphashape cost grows superlinearly in N. cluster_eps is 0.8m, so
+        snapping to a 0.15m grid can't change which DBSCAN cluster a point
+        belongs to and leaves the polygon envelope visually identical.
+        """
+        pts = np.asarray(points_xyz, dtype=np.float32)
+        if len(pts) == 0:
+            return pts
+        voxel = float(self.alpha_input_voxel)
+        if voxel > 0.0 and len(pts) > 32:
+            keys = np.floor(pts[:, :2] / voxel).astype(np.int64)
+            # Encode (kx, ky) into a single key for np.unique.
+            key_min = keys.min(axis=0)
+            keys -= key_min
+            span_y = int(keys[:, 1].max()) + 1
+            encoded = keys[:, 0] * span_y + keys[:, 1]
+            _, first_idx = np.unique(encoded, return_index=True)
+            pts = pts[first_idx]
+        cap = int(self.alpha_input_max_points)
+        if cap > 0 and len(pts) > cap:
+            rng = np.random.default_rng(0)
+            sel = rng.choice(len(pts), cap, replace=False)
+            pts = pts[sel]
+        return pts
+
+    def _extract_outline(self, points_xyz):
+        if self.outline_method == "bev":
+            return self._extract_outline_bev(points_xyz)
+        reduced = self._voxel_downsample_xyz(points_xyz)
+        return extract_outline_by_alphashape(reduced, alpha=self.outline_alpha)
 
     def make_record(self, logical_index, process_ctx, cluster_points, contour_xy, sidewalk_z):
         centroid = cluster_points[:, :2].mean(axis=0).astype(np.float32) if len(cluster_points) != 0 else np.zeros((2,), dtype=np.float32)
@@ -61,29 +314,14 @@ class SidewalkEdgeProcess(VectorProcess):
 
     def _cluster_score(self, cluster_points, polygon, process_center_xy):
         area = float(polygon.area)
-        perimeter = max(float(polygon.length), 1e-6)
-        density = float(len(cluster_points)) / max(area, 1e-6)
-        compactness = float(4.0 * np.pi * area / (perimeter * perimeter))
         centroid = cluster_points[:, :2].mean(axis=0).astype(np.float32)
-        center_dist = float(np.linalg.norm(centroid - process_center_xy))
 
+        # Only reject tiny fragmented point noise; candidate priority is area.
         if area < self.min_cluster_area:
             return None
-        if density < self.min_cluster_density:
-            return None
-        if compactness < self.min_compactness:
-            return None
-        if center_dist > self.max_center_distance:
-            return None
 
-        score = (
-            1.0 * float(len(cluster_points))
-            + 6.0 * np.sqrt(max(area, 0.0))
-            + 3.0 * density
-            - 0.4 * center_dist
-        )
         return {
-            "score": float(score),
+            "score": area,
             "centroid": centroid,
         }
 
@@ -103,7 +341,7 @@ class SidewalkEdgeProcess(VectorProcess):
             if len(cluster_points) < 3:
                 continue
 
-            contour_xy = extract_outline_by_alphashape(cluster_points, alpha=self.outline_alpha)
+            contour_xy = self._extract_outline(cluster_points)
             polygon, error_msg = polygon_from_outline(contour_xy)
             if polygon is None:
                 if error_msg:
@@ -139,7 +377,23 @@ class SidewalkEdgeProcess(VectorProcess):
             print(f"skip: empty history window for {self.name} @ {logical_index}")
             return False
 
-        merged_points = process_ctx["current_points"]
+        # 803a0e1 default: cluster on the raw class-15 window points; let
+        # DBSCAN + score-based filtering reject the noise. The BEV temporal-
+        # voting path is reachable by setting `sidewalk_use_bev_vote: true`
+        # for A/B comparison — by default it shrinks polygons below the real
+        # sidewalk extent, so we don't run it here.
+        if self.use_bev_vote:
+            full_window = list(self.full_history[self.dirc_window:(self.dirc_window + self.window_size)])
+            merged_points = self._bev_temporal_vote(full_window)
+            if len(merged_points) == 0:
+                print(f"skip: BEV vote produced no stable sidewalk cells @ {logical_index}")
+                return False
+        else:
+            merged_points = process_ctx["current_points"]
+            if len(merged_points) == 0:
+                print(f"skip: empty class-{self.target_class} window @ {logical_index}")
+                return False
+
         results = self.extract_candidate_outlines(merged_points, process_ctx["current_center"])
         if not results:
             print(f"skip: no valid sidewalk outline @ {logical_index}")
@@ -191,35 +445,23 @@ class SidewalkEdgeProcess(VectorProcess):
         }
 
     def merge_track_outline(self, base_polygon, new_polygon, outline_arrays):
+        # Phase 1.4: previously this re-ran alpha-shape on every accumulated
+        # outline-point set after each successful merge — O(N^2) work over
+        # the lifetime of a track, and the top contributor to fuse_records
+        # cost on the 200-frame pkl. The final polished outline is now
+        # computed once per track in update_track_metadata; here we only
+        # need a cheap union for the running polygon (used for future
+        # overlap tests).
         if base_polygon is None or new_polygon is None:
             return base_polygon, False
 
         base_hit = base_polygon.buffer(self.merge_overlap_buffer)
-        new_hit = new_polygon.buffer(self.merge_overlap_buffer)
-        if base_hit.intersection(new_hit).is_empty:
+        if not base_hit.intersects(new_polygon):
             return base_polygon, False
 
-        merged_points = []
-        for arr in outline_arrays:
-            arr = as_xy(arr)
-            if len(arr) != 0:
-                merged_points.append(arr)
-        if not merged_points:
-            merged = base_polygon.union(new_polygon)
-            return merged, True
-
-        merged_xy = np.vstack(merged_points)
-        merged_outline = extract_outline_by_alphashape(
-            np.column_stack((merged_xy, np.zeros((len(merged_xy),), dtype=np.float32))),
-            alpha=self.outline_alpha,
-        )
-        merged_polygon, error_msg = polygon_from_outline(merged_outline)
-        if merged_polygon is None:
-            if error_msg:
-                print(f"merge_track_outline: polygon_from_outline failed: {error_msg}")
-            merged_polygon = base_polygon.union(new_polygon)
-            if isinstance(merged_polygon, MultiPolygon):
-                merged_polygon = max(merged_polygon.geoms, key=lambda geom: geom.area)
+        merged_polygon = base_polygon.union(new_polygon)
+        if isinstance(merged_polygon, MultiPolygon):
+            merged_polygon = max(merged_polygon.geoms, key=lambda geom: geom.area)
         return merged_polygon, True
 
     def update_track_metadata(self, track):
@@ -230,6 +472,28 @@ class SidewalkEdgeProcess(VectorProcess):
             smooth_iterations = int(self.config.get("sidewalk_smooth_iterations", self.fused_outline_smooth_iterations))
             min_seg_len = float(self.config.get("sidewalk_min_seg_len", self.fused_outline_min_seg_len))
             post_simplify_tol = float(self.config.get("sidewalk_post_simplify_tol", self.fused_outline_post_simplify_tol))
+            close_buf = float(self.config.get("sidewalk_close_buffer", self.fused_outline_close_buffer))
+            open_buf = float(self.config.get("sidewalk_open_buffer", self.fused_outline_open_buffer))
+
+            # Vector morphology: close fills concavities (alpha-shape teeth),
+            # open shaves single-point spikes. Both before any line-simplify
+            # so the simplifier sees a clean boundary.
+            try:
+                if close_buf > 0:
+                    closed = polygon.buffer(close_buf).buffer(-close_buf)
+                    if not closed.is_empty:
+                        if isinstance(closed, MultiPolygon):
+                            closed = max(closed.geoms, key=lambda g: g.area)
+                        polygon = closed
+                if open_buf > 0:
+                    opened = polygon.buffer(-open_buf).buffer(open_buf)
+                    if not opened.is_empty:
+                        if isinstance(opened, MultiPolygon):
+                            opened = max(opened.geoms, key=lambda g: g.area)
+                        polygon = opened
+                outline_xy = outline_from_polygon(polygon)
+            except Exception as e:
+                print(f"update_track_metadata: buffer regularize failed: {e}")
 
             simplified = polygon.simplify(simplify_tol, preserve_topology=True)
             simplified_polygon, error_msg1 = polygon_from_outline(outline_from_polygon(simplified))
@@ -259,7 +523,11 @@ class SidewalkEdgeProcess(VectorProcess):
         track["outline"] = outline_xy.tolist()
         track["area"] = float(polygon.area) if polygon is not None else 0.0
 
-        points = [as_xy(arr) for arr in track["_outline_arrays"] if len(as_xy(arr)) != 0]
+        points = []
+        for arr in track["_outline_arrays"]:
+            xy = as_xy(arr)
+            if len(xy) != 0:
+                points.append(xy)
         if points:
             merged_points = np.vstack(points)
             track["centroid"] = merged_points.mean(axis=0).astype(np.float32).tolist()
@@ -268,6 +536,75 @@ class SidewalkEdgeProcess(VectorProcess):
 
         if track["_z_values"]:
             track["sidewalk_z"] = float(np.mean(track["_z_values"]))
+
+    def _merge_contained_or_overlapping_tracks(self, tracks):
+        """Pairwise post-fusion sweep.
+
+        The per-record fusion loop is greedy and order-dependent: two
+        records that arrive far apart in time can each seed an independent
+        track that, after enough later merges, end up nested or
+        substantially overlapping. The user observed this as "sidewalks
+        inside another sidewalk" in the BEV.
+
+        This pass iterates pairs to a fixed point and merges any pair where
+        - one polygon contains the other, OR
+        - intersection_area / min(area_i, area_j) >= threshold
+
+        Threshold defaults to 0.3 (i.e. they share at least 30% of the
+        smaller polygon's area). Tunable via
+        `sidewalk_pairwise_merge_min_overlap_ratio` in config.
+        """
+        if len(tracks) < 2:
+            return tracks
+
+        threshold = float(self.config.get("sidewalk_pairwise_merge_min_overlap_ratio", 0.10))
+        changed = True
+        while changed:
+            changed = False
+            i = 0
+            while i < len(tracks):
+                p_i = tracks[i].get("_polygon")
+                if p_i is None or p_i.is_empty:
+                    i += 1
+                    continue
+                bx_i = p_i.bounds  # (minx, miny, maxx, maxy)
+                j = i + 1
+                while j < len(tracks):
+                    p_j = tracks[j].get("_polygon")
+                    if p_j is None or p_j.is_empty:
+                        j += 1
+                        continue
+                    # Cheap bbox reject before the expensive shapely calls.
+                    bx_j = p_j.bounds
+                    if (bx_i[2] < bx_j[0] or bx_j[2] < bx_i[0]
+                            or bx_i[3] < bx_j[1] or bx_j[3] < bx_i[1]):
+                        j += 1
+                        continue
+                    try:
+                        contains = p_i.contains(p_j) or p_j.contains(p_i)
+                        inter_area = float(p_i.intersection(p_j).area)
+                    except Exception:
+                        j += 1
+                        continue
+                    min_area = float(min(p_i.area, p_j.area))
+                    overlap_ratio = inter_area / min_area if min_area > 1e-6 else 0.0
+                    if not (contains or overlap_ratio >= threshold):
+                        j += 1
+                        continue
+
+                    merged = p_i.union(p_j)
+                    if isinstance(merged, MultiPolygon):
+                        merged = max(merged.geoms, key=lambda geom: geom.area)
+                    tracks[i]["_polygon"] = merged
+                    tracks[i]["_outline_arrays"].extend(tracks[j].get("_outline_arrays", []))
+                    tracks[i]["_z_values"].extend(tracks[j].get("_z_values", []))
+                    tracks[i]["source_indices"].extend(tracks[j].get("source_indices", []))
+                    tracks[i]["outlines"].extend(tracks[j].get("outlines", []))
+                    tracks.pop(j)
+                    p_i = merged
+                    changed = True
+                i += 1
+        return tracks
 
     def fuse_records(self):
         track_id = 0
@@ -298,32 +635,20 @@ class SidewalkEdgeProcess(VectorProcess):
             matched_track["_z_values"].append(float(record["sidewalk_z"]))
             matched_track["source_indices"].append(int(record["index"]))
             matched_track["outlines"].append(outline_xy.tolist())
-            self.update_track_metadata(matched_track)
+            # Phase 1.3: smoothing/simplify chain runs once per track at the
+            # end, not after every merge.
+
+        # Pairwise contains/overlap consolidation runs before per-track
+        # metadata so the final outline reflects the merged extent.
+        tracks = self._merge_contained_or_overlapping_tracks(tracks)
 
         for track in tracks:
             self.update_track_metadata(track)
             for key in ("_polygon", "_outline_arrays", "_z_values"):
                 track.pop(key, None)
 
-        min_area = float(self.config.get("sidewalk_min_area", self.fused_min_area))
-        min_support_frames = int(self.config.get("sidewalk_min_support_frames", self.fused_min_support_frames))
-        min_support_span = int(self.config.get("sidewalk_min_support_span", 0))
-        filtered_tracks = []
         for track in tracks:
-            source_indices = sorted(set(int(v) for v in track.get("source_indices", [])))
-            support_frames = len(source_indices)
-            support_span = (source_indices[-1] - source_indices[0]) if len(source_indices) >= 2 else 0
-            area = float(track.get("area", 0.0))
-            if support_frames < min_support_frames:
-                continue
-            if support_span < min_support_span:
-                continue
-            if area < min_area:
-                continue
-            track["source_indices"] = source_indices
-            filtered_tracks.append(track)
-
-        tracks = filtered_tracks
+            track["source_indices"] = sorted(set(int(v) for v in track.get("source_indices", [])))
         tracks.sort(key=lambda item: len(item["source_indices"]), reverse=True)
         return tracks
 

@@ -1,3 +1,5 @@
+import os
+
 from detectron2.config import get_cfg
 from detectron2.projects.deeplab import add_deeplab_config
 from imseg.mask2former.mask2former import add_maskformer2_config
@@ -5,6 +7,7 @@ from detectron2.engine.defaults import DefaultPredictor
 from mmseg.apis import inference_segmentor, init_segmentor
 import mmcv
 import numpy as np
+import torch
 
 import json
 
@@ -20,15 +23,21 @@ def get_colors(cmap = 'mapillary'):
     if cmap == 'cityscapes':
         return create_cityscapes_label_colormap()
 
-def get_predict_func_detectron(conf_file,model_file):
+def get_predict_func_detectron(conf_file, model_file, device=None):
     opts = ['MODEL.WEIGHTS', model_file]
+    if device is None:
+        device = os.environ.get("HDMAP_PREDICT_DEVICE")
     config = conf_file
     cfg = get_cfg()
     add_deeplab_config(cfg)
     add_maskformer2_config(cfg)
     cfg.merge_from_file(config)
     cfg.merge_from_list(opts)
+    if device:
+        cfg.MODEL.DEVICE = str(device)
     cfg.freeze()
+    if str(cfg.MODEL.DEVICE).startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.empty_cache()
     predictor_base = DefaultPredictor(cfg)
     def predictor(img):
         simg = predictor_base(img)
