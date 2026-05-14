@@ -1062,6 +1062,14 @@ def main():
     parser.add_argument("--lidar-stride", default=None, type=int, help="Keep every Nth lidar point before processing.")
     parser.add_argument("--max-lidar-points", default=None, type=int, help="Optional hard cap per lidar packet after stride.")
     parser.add_argument("--predict-image-scale", default=None, type=float, help="Scale factor for segmentation inference image.")
+    parser.add_argument("--offline", action="store_true",
+                        help="Skip ROS init + topic publishes + per-frame "
+                             "originpics/sempics disk writes. ~15-25% faster "
+                             "when you don't need rviz / debug images.")
+    parser.add_argument("--time-it", action="store_true",
+                        help="Per-stage wall-time profiling: each frame "
+                             "prints ms in bag_read/decode/m2f/project/io. "
+                             "Summary at end.")
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:
@@ -1199,20 +1207,38 @@ def main():
             print(f"[imu] loaded {n_imu} samples from {imu_topic}, "
                   f"t∈[{imu_buffer.t[0]:.3f}, {imu_buffer.t[-1]:.3f}]")
 
-    rospy.init_node("fix_distortion", anonymous=False, log_level=rospy.DEBUG, disable_signals=True)
-    fixCloudPubHandle = rospy.Publisher("dedistortion_cloud", PointCloud2, queue_size=5)
-    semanticCloudPubHandle = rospy.Publisher("SemanticCloud", PointCloud2, queue_size=5)
-    roadCloudPubHandle = rospy.Publisher("RoadCloud", PointCloud2, queue_size=5)
-    imgPubHandle = rospy.Publisher("Img", Image, queue_size=5)
-    semimgPubHandle = rospy.Publisher("SemanticImg", Image, queue_size=5)
-    groundTruthPubHandle = rospy.Publisher("ground_truth", Path, queue_size=0)
-    _ = groundTruthPubHandle
-    print("ros ready")
+    class _NullPublisher:
+        """Drop-in stand-in for rospy.Publisher in --offline mode."""
+        def publish(self, *_args, **_kwargs):
+            return None
+
+    if not args.offline:
+        rospy.init_node("fix_distortion", anonymous=False,
+                        log_level=rospy.DEBUG, disable_signals=True)
+        fixCloudPubHandle = rospy.Publisher("dedistortion_cloud", PointCloud2, queue_size=5)
+        semanticCloudPubHandle = rospy.Publisher("SemanticCloud", PointCloud2, queue_size=5)
+        roadCloudPubHandle = rospy.Publisher("RoadCloud", PointCloud2, queue_size=5)
+        imgPubHandle = rospy.Publisher("Img", Image, queue_size=5)
+        semimgPubHandle = rospy.Publisher("SemanticImg", Image, queue_size=5)
+        groundTruthPubHandle = rospy.Publisher("ground_truth", Path, queue_size=0)
+        _ = groundTruthPubHandle
+        print("ros ready")
+    else:
+        fixCloudPubHandle = _NullPublisher()
+        semanticCloudPubHandle = _NullPublisher()
+        roadCloudPubHandle = _NullPublisher()
+        imgPubHandle = _NullPublisher()
+        semimgPubHandle = _NullPublisher()
+        print("offline: ROS publishers stubbed out")
 
     predictor_kwargs = {}
     class_margin_min = config.get("class_margin_min")
     if class_margin_min:
         predictor_kwargs["class_margin_min"] = {int(k): float(v) for k, v in class_margin_min.items()}
+    if bool(config.get("predict_fp16", False)):
+        predictor_kwargs["fp16"] = True
+    if config.get("predict_input_size") is not None:
+        predictor_kwargs["input_size"] = int(config["predict_input_size"])
     predictor = getattr(predict, config["predict_func"])(
         config["model_config"], config["model_file"], **predictor_kwargs,
     )
@@ -1233,6 +1259,60 @@ def main():
     lidar_queue = deque(maxlen=max(10, int(lidar_queue_size)))
     image_queue = deque()
 
+    # ------------------------------------------------------------------
+    # Lightweight stage timing. Tracks accumulated milliseconds per
+    # stage; only does anything when args.time_it is true.
+    # ------------------------------------------------------------------
+    import time as _time
+    class _Timing:
+        STAGES = ("bag_read", "lidar_pre", "img_decode", "pose_lookup",
+                  "align_pcd", "m2f_seg", "pcd_save", "publish_io",
+                  "rolling_plane")
+
+        def __init__(self, enabled):
+            self.enabled = bool(enabled)
+            self._totals = {s: 0.0 for s in self.STAGES}
+            self._n = 0
+            self._t0 = None
+            self._wall0 = _time.perf_counter()
+
+        def tick(self):
+            if self.enabled:
+                self._t0 = _time.perf_counter()
+
+        def tock(self, stage):
+            if self.enabled and self._t0 is not None:
+                dt = _time.perf_counter() - self._t0
+                self._totals[stage] = self._totals.get(stage, 0.0) + dt
+                self._t0 = _time.perf_counter()
+
+        def frame_done(self):
+            if not self.enabled:
+                return
+            self._n += 1
+            if self._n % 50 == 0:
+                wall = _time.perf_counter() - self._wall0
+                msg = " ".join(
+                    f"{s}={1000.0 * self._totals[s] / self._n:.0f}ms"
+                    for s in self.STAGES if self._totals.get(s, 0.0) > 0
+                )
+                print(f"[timing] n={self._n} wall={wall:.1f}s avg/frame: {msg}")
+
+        def summary(self):
+            if not self.enabled or self._n == 0:
+                return
+            wall = _time.perf_counter() - self._wall0
+            print(f"\n=== TIMING SUMMARY (n={self._n} frames, wall={wall:.1f}s) ===")
+            for s in self.STAGES:
+                t = self._totals.get(s, 0.0)
+                print(f"  {s:15s} total={t:6.1f}s  avg={1000.0*t/self._n:5.1f}ms/frame  "
+                      f"({100.0*t/wall:4.1f}% of wall)")
+            unaccounted = wall - sum(self._totals.values())
+            print(f"  {'(unaccounted)':15s} total={unaccounted:6.1f}s  "
+                  f"({100.0*unaccounted/wall:4.1f}% of wall)")
+
+    timing = _Timing(bool(args.time_it))
+
     try:
         bag = Bag(bag_path)
         start = bag.get_start_time() + float(start_offset)
@@ -1241,8 +1321,9 @@ def main():
         bagread = bag.read_messages(topics=[lidar_topic, camera_topic], start_time=start_t, end_time=end_t)
         print("bag ready")
 
-        cmkdir(config["save_folder"] + "/originpics")
-        cmkdir(config["save_folder"] + "/sempics")
+        if not args.offline:
+            cmkdir(config["save_folder"] + "/originpics")
+            cmkdir(config["save_folder"] + "/sempics")
         store_file = open(config["save_folder"] + "/outdoor.pkl", "wb")
         # Stream road-class points to a chunks file instead of holding the
         # whole-run list in memory (was ~1.6 GB resident on the 21-min bag).
@@ -1250,7 +1331,9 @@ def main():
         road_chunks_path = config["save_folder"] + "/road_chunks.pkl"
         road_chunks_file = open(road_chunks_path, "wb")
 
+        timing.tick()
         for topic, msg, stamp in bagread:
+            timing.tock("bag_read")
             if STOP_REQUESTED or STOP_AFTER_MAX_FRAMES or rospy.is_shutdown():
                 break
             msg_total += 1
@@ -1271,9 +1354,11 @@ def main():
                     imu_buffer,
                 )
                 lidar_queue.append({"timestamp": base_ts, "points_xyzi": undistorted_xyzi})
+                timing.tock("lidar_pre")
             elif topic == camera_topic:
                 msg_camera += 1
                 image_queue.append((message_stamp_sec(msg, stamp), msg))
+                timing.tock("lidar_pre")
             else:
                 continue
 
@@ -1294,12 +1379,14 @@ def main():
                     print(f"skip image frame at {img_ts:.3f}: {e}")
                     image_queue.popleft()
                     continue
+                timing.tock("img_decode")
 
                 lidar_pose = ie_provider.get_interpolated(float(nearest["timestamp"]))
                 image_pose = ie_provider.get_interpolated(float(img_ts))
                 if lidar_pose is None or image_pose is None:
                     image_queue.popleft()
                     continue
+                timing.tock("pose_lookup")
 
                 align_pcd = transform_lidar_points_between_timestamps(
                     nearest["points_xyzi"],
@@ -1308,10 +1395,13 @@ def main():
                     ecef_origin,
                     enu_from_ecef,
                 )
+                timing.tock("align_pcd")
 
-                fixcloud = get_i_pcd_msg(align_pcd)
-                fixcloud.header.frame_id = "lidar"
-                fixCloudPubHandle.publish(fixcloud)
+                if not args.offline:
+                    fixcloud = get_i_pcd_msg(align_pcd)
+                    fixcloud.header.frame_id = "lidar"
+                    fixCloudPubHandle.publish(fixcloud)
+                    timing.tock("publish_io")
 
                 index += 1
                 processed_with_lidar += 1
@@ -1332,8 +1422,10 @@ def main():
                     if coefs is not None:
                         class_plane_coefs_cur[cls_id] = coefs
 
-                imgPubHandle.publish(bri.cv2_to_imgmsg(img))
-                cv2.imwrite(config["save_folder"] + "/originpics/%06d.png" % index, img)
+                if not args.offline:
+                    imgPubHandle.publish(bri.cv2_to_imgmsg(img))
+                    cv2.imwrite(config["save_folder"] + "/originpics/%06d.png" % index, img)
+                    timing.tock("publish_io")
 
                 sem_pcd_lidar, semimg = get_semantic_pcd(
                     img,
@@ -1355,9 +1447,12 @@ def main():
                     suppress_near_person_px=suppress_near_person_px,
                     person_class=person_class,
                 )
-                cv2.imwrite(config["save_folder"] + "/sempics/%06d.png" % index, semimg)
-                semimg_vis = colors[semimg.flatten()].reshape((*semimg.shape, 3))
-                semimgPubHandle.publish(bri.cv2_to_imgmsg(semimg_vis, "bgr8"))
+                timing.tock("m2f_seg")
+                if not args.offline:
+                    cv2.imwrite(config["save_folder"] + "/sempics/%06d.png" % index, semimg)
+                    semimg_vis = colors[semimg.flatten()].reshape((*semimg.shape, 3))
+                    semimgPubHandle.publish(bri.cv2_to_imgmsg(semimg_vis, "bgr8"))
+                    timing.tock("publish_io")
 
                 if rolling_planes and len(sem_pcd_lidar) > 0:
                     pts_lidar_xyz = sem_pcd_lidar[:, :3]
@@ -1368,25 +1463,30 @@ def main():
                         near_mask = (sem_pcd_lidar[:, 3] == float(cls_id)) & (cam_z <= fit_depth) & (cam_z > 0.0)
                         if near_mask.any():
                             est.add(R_enu_from_lidar_cur, t_enu_lidar_cur, pts_lidar_xyz[near_mask])
+                timing.tock("rolling_plane")
 
                 sem_world_pcd = transform_semantic_lidar_to_world(sem_pcd_lidar, image_pose, ecef_origin, enu_from_ecef)
                 pickle.dump(sem_world_pcd, store_file)
                 store_file.flush()
 
                 if len(sem_world_pcd) != 0:
-                    sem_msg = get_rgba_pcd_msg(sem_world_pcd)
-                    sem_msg.header.frame_id = "world"
-                    semanticCloudPubHandle.publish(sem_msg)
                     road_world_pcd = sem_world_pcd[sem_world_pcd[:, 3] == road_class]
                     if len(road_world_pcd) != 0:
                         pickle.dump(road_world_pcd, road_chunks_file)
                         road_chunk_count += 1
-                        road_msg = get_rgba_pcd_msg(road_world_pcd)
-                        road_msg.header.frame_id = "world"
-                        roadCloudPubHandle.publish(road_msg)
-                else:
+                    if not args.offline:
+                        sem_msg = get_rgba_pcd_msg(sem_world_pcd)
+                        sem_msg.header.frame_id = "world"
+                        semanticCloudPubHandle.publish(sem_msg)
+                        if len(road_world_pcd) != 0:
+                            road_msg = get_rgba_pcd_msg(road_world_pcd)
+                            road_msg.header.frame_id = "world"
+                            roadCloudPubHandle.publish(road_msg)
+                elif not args.offline:
                     print("semantic point publish skipped: empty semantic frame saved for alignment")
+                timing.tock("pcd_save")
                 image_queue.popleft()
+                timing.frame_done()
             if STOP_REQUESTED or STOP_AFTER_MAX_FRAMES or rospy.is_shutdown():
                 break
     except rospy.ROSInterruptException:
@@ -1394,6 +1494,7 @@ def main():
     except KeyboardInterrupt:
         request_stop("KeyboardInterrupt")
     finally:
+        timing.summary()
         if store_file is not None:
             store_file.close()
         if road_chunks_file is not None:

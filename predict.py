@@ -23,7 +23,7 @@ def get_colors(cmap = 'mapillary'):
     if cmap == 'cityscapes':
         return create_cityscapes_label_colormap()
 
-def get_predict_func_detectron(conf_file, model_file, device=None, class_margin_min=None):
+def get_predict_func_detectron(conf_file, model_file, device=None, class_margin_min=None, fp16=False, input_size=None):
     """`class_margin_min`: optional `{class_id: min_margin}`. For each listed
     class, the predicted pixel is kept only if its softmax score beats the
     runner-up by at least `min_margin`. Halo pixels around persons (where
@@ -42,6 +42,9 @@ def get_predict_func_detectron(conf_file, model_file, device=None, class_margin_
     cfg.merge_from_list(opts)
     if device:
         cfg.MODEL.DEVICE = str(device)
+    if input_size is not None:
+        cfg.INPUT.MIN_SIZE_TEST = int(input_size)
+        cfg.INPUT.MAX_SIZE_TEST = int(input_size)
     cfg.freeze()
     if str(cfg.MODEL.DEVICE).startswith("cuda") and torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -57,8 +60,14 @@ def get_predict_func_detectron(conf_file, model_file, device=None, class_margin_
         gate_ids = None
         gate_thr = None
 
+    use_fp16 = bool(fp16) and str(cfg.MODEL.DEVICE).startswith("cuda")
+
     def predictor(img):
-        simg = predictor_base(img)['sem_seg']  # (C, H, W), post-softmax
+        if use_fp16:
+            with torch.cuda.amp.autocast(dtype=torch.float16):
+                simg = predictor_base(img)['sem_seg']
+        else:
+            simg = predictor_base(img)['sem_seg']  # (C, H, W), post-softmax
         if gate_ids is None:
             # Legacy path: per-class score floor of 0.5 then argmax.
             simg = simg.clone()
