@@ -7,6 +7,7 @@ import os
 import pickle
 import re
 import signal
+import sys
 from collections import deque
 from dataclasses import dataclass
 
@@ -1444,6 +1445,58 @@ def main():
             bag.close()
         pose_array = np.stack(pose_save) if len(pose_save) != 0 else np.empty((0, 7))
         np.savetxt(config["save_folder"] + "/pose.csv", pose_array, delimiter=",")
+        # Sidewalk-class noise post-pass: load the pkl just written, run the
+        # knn-plane denoiser on class={sidewalk_class}, rewrite atomically.
+        # Must run AFTER store_file.close() and only if frames were written.
+        if index > 0 and bool(config.get("denoise_sidewalk_post", True)):
+            try:
+                _tools_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools")
+                if _tools_dir not in sys.path:
+                    sys.path.insert(0, _tools_dir)
+                from clean_outdoor_pkl_sidewalk_noise import denoise_pkl_class_inplace
+                ds_cfg = dict(config.get("denoise_sidewalk", {}))
+                pkl_path = config["save_folder"] + "/outdoor.pkl"
+                noisy_backup = pkl_path + ".noisy"
+                # Always overwrite the .noisy backup -- it represents "the
+                # raw pkl from this run" and re-running the producer should
+                # refresh it, not refuse.
+                if os.path.exists(noisy_backup):
+                    try:
+                        os.remove(noisy_backup)
+                    except OSError as e:
+                        print(f"warning: could not remove stale {noisy_backup}: {e!r}")
+                stats = denoise_pkl_class_inplace(
+                    pkl_path=pkl_path,
+                    keep_class=sidewalk_class,
+                    method=ds_cfg.get("method", "knn-plane"),
+                    fit_voxel=float(ds_cfg.get("fit_voxel", 0.05)),
+                    knn_k=int(ds_cfg.get("knn_k", 64)),
+                    knn_q=float(ds_cfg.get("knn_q", 10.0)),
+                    knn_plane_band=float(ds_cfg.get("knn_plane_band", 0.20)),
+                    tau_above=float(ds_cfg.get("tau_above", 0.20)),
+                    tau_below=float(ds_cfg.get("tau_below", 0.10)),
+                    sor_k=int(ds_cfg.get("sor_k", 12)),
+                    sor_std=float(ds_cfg.get("sor_std", 2.0)),
+                    backup_suffix=".noisy",
+                    overwrite_backup=False,
+                )
+                print(
+                    "denoise_sidewalk: class={} {} -> {} kept ({} dropped); "
+                    "raw backup at {}".format(
+                        sidewalk_class,
+                        stats.get("n_target_before", 0),
+                        stats.get("n_target_after", 0),
+                        stats.get("n_dropped", 0),
+                        noisy_backup,
+                    )
+                )
+            except Exception as e:
+                print(
+                    f"warning: sidewalk denoise post-pass failed ({e!r}); "
+                    f"pkl left as raw (noisy) output. "
+                    f"You can re-run manually via tools/clean_outdoor_pkl_sidewalk_noise.py."
+                )
+
         if road_chunks_path is not None and road_chunk_count > 0:
             try:
                 chunks = []

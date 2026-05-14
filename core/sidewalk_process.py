@@ -162,6 +162,29 @@ class SidewalkEdgeProcess(VectorProcess):
     alpha_input_voxel = 0.15
     alpha_input_max_points = 4000
 
+    # Person-as-sidewalk-proxy: PM-style data has two ArUco-tagged walkers
+    # ahead of the cart at near-constant distance. They persistently occlude
+    # the center strip of the sidewalk that the LiDAR can never see (shadow
+    # trails in world coords as cart moves). But these walkers are walking on
+    # that very strip, so their class=19 LiDAR points are direct proxies for
+    # the missing sidewalk surface beneath them.
+    # Random pedestrians are NOT promoted (they may walk on the road / lawn
+    # / crosswalk and corrupt the polygon). Crosswalk crossings by our cart
+    # are also out-of-scope for now.
+    # When enabled, each frame:
+    #   - look up ArUco walker world XY (from a precomputed JSON map)
+    #   - take class=person LiDAR points within `person_proxy_walker_radius_m`
+    #     of any walker XY -- these are points on the walker's body
+    #   - additionally gate by proximity to existing class=15 sidewalk points
+    #     (>= `person_proxy_min_sw_count` within `person_proxy_search_radius_m`)
+    #   - snap their Z to the median Z of nearby sidewalk and relabel as
+    #     class=15
+    person_proxy_enable = False  # off until aruco_walker_map_json is provided
+    person_class_id = 19
+    person_proxy_search_radius_m = 2.0
+    person_proxy_min_sw_count = 30
+    person_proxy_walker_radius_m = 0.8
+
     def __init__(self, args, config):
         super().__init__(args, config)
         self.step = max(int(config.get("sidewalk_step", config.get("vector_step", self.step))), 1)
@@ -202,8 +225,75 @@ class SidewalkEdgeProcess(VectorProcess):
         self.use_bev_vote = bool(config.get("sidewalk_use_bev_vote", self.use_bev_vote))
         self.alpha_input_voxel = float(config.get("sidewalk_alpha_input_voxel", self.alpha_input_voxel))
         self.alpha_input_max_points = max(int(config.get("sidewalk_alpha_input_max_points", self.alpha_input_max_points)), 0)
+        self.person_class_id = int(config.get("sidewalk_person_class_id",
+                                              config.get("person_class", self.person_class_id)))
+        self.person_proxy_search_radius_m = float(
+            config.get("sidewalk_person_proxy_search_radius_m", self.person_proxy_search_radius_m))
+        self.person_proxy_min_sw_count = int(
+            config.get("sidewalk_person_proxy_min_sw_count", self.person_proxy_min_sw_count))
+        self.person_proxy_walker_radius_m = float(
+            config.get("sidewalk_person_proxy_walker_radius_m", self.person_proxy_walker_radius_m))
+        # ArUco walker map: precomputed JSON mapping 0-based frame index ->
+        # list of {id, world_xy} from tools/detect_aruco_walkers.py. Without
+        # this, person_proxy stays off (random pedestrians are unsafe).
+        self._aruco_walker_map = None
+        aruco_map_path = config.get("sidewalk_aruco_walker_map_json")
+        if aruco_map_path:
+            import json as _json
+            with open(aruco_map_path, "r") as f:
+                raw = _json.load(f)
+            # Normalize: keys are stringified ints in JSON
+            self._aruco_walker_map = {
+                int(k): [tuple(map(float, v["world_xy"])) for v in lst]
+                for k, lst in raw.get("frames", {}).items()
+            }
+            self.person_proxy_enable = True
+            print(f"[sidewalk] loaded ArUco walker map: {len(self._aruco_walker_map)} frames")
+        self._frame_index_counter = -1   # incremented in ingest_frame
+        self._virtual_augment_log = []   # diagnostics
+
+    def _augment_with_person_proxy(self, sempcd, frame_idx):
+        """Promote class=person LiDAR points (those near an ArUco walker)
+        to class=sidewalk after snapping Z to local ground. See class docstring."""
+        if (not self.person_proxy_enable or sempcd is None or len(sempcd) == 0
+                or self._aruco_walker_map is None):
+            return sempcd
+        walkers = self._aruco_walker_map.get(int(frame_idx), [])
+        if not walkers:
+            return sempcd
+        pp_mask = sempcd[:, 3] == self.person_class_id
+        sw_mask = sempcd[:, 3] == self.target_class
+        if not pp_mask.any():
+            return sempcd
+        sw_pts = sempcd[sw_mask]
+        if len(sw_pts) < self.person_proxy_min_sw_count:
+            return sempcd
+        pp_pts = sempcd[pp_mask]
+        # Walker proximity: person point XY within R of any walker XY
+        walker_xy = np.asarray(walkers, dtype=np.float64)
+        # Vectorized: distance from each person point to nearest walker
+        diffs = pp_pts[:, None, :2] - walker_xy[None, :, :]
+        d2 = np.einsum("ijk,ijk->ij", diffs, diffs)
+        near_walker = (d2.min(axis=1) <= self.person_proxy_walker_radius_m ** 2)
+        if not near_walker.any():
+            return sempcd
+        # Additional gate: must also be near existing sidewalk
+        from scipy.spatial import cKDTree
+        tree = cKDTree(sw_pts[:, :2])
+        dist, _ = tree.query(pp_pts[near_walker, :2], k=1)
+        near_sw = dist <= float(self.person_proxy_search_radius_m)
+        if not near_sw.any():
+            return sempcd
+        idx_near_walker = np.where(near_walker)[0][near_sw]
+        z_local = float(np.median(sw_pts[:, 2]))
+        virtual = pp_pts[idx_near_walker].copy()
+        virtual[:, 2] = z_local
+        virtual[:, 3] = float(self.target_class)
+        self._virtual_augment_log.append((int(frame_idx), int(len(virtual))))
+        return np.vstack([sempcd, virtual])
 
     def ingest_frame(self, sempcd):
+        self._frame_index_counter += 1
         # Base class drops everything but the target class; Phase A.2 needs
         # the *full* per-frame cloud so the BEV vote can compute the per-cell
         # sidewalk fraction. Keep both queues in lockstep so window slicing
@@ -217,6 +307,7 @@ class SidewalkEdgeProcess(VectorProcess):
                 self.full_history.append(empty)
             return
         sempcd = np.asarray(sempcd, dtype=np.float32)
+        sempcd = self._augment_with_person_proxy(sempcd, self._frame_index_counter)
         self.history.append(sempcd[sempcd[:, 3] == self.target_class])
         if self.use_bev_vote:
             self.full_history.append(sempcd)
