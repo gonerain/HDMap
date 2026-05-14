@@ -17,71 +17,19 @@ Output:
 """
 import argparse
 import json
-import math
+import os
+import sys
 from pathlib import Path
 
 import numpy as np
 
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-# --- Geodetic conversions (copies of outdoor_livox_ie.py helpers) ---
-
-def geodetic_to_ecef(lat_deg, lon_deg, h_m):
-    a = 6378137.0
-    e2 = 6.69437999014e-3
-    lat = math.radians(lat_deg)
-    lon = math.radians(lon_deg)
-    sin_lat = math.sin(lat)
-    cos_lat = math.cos(lat)
-    sin_lon = math.sin(lon)
-    cos_lon = math.cos(lon)
-    n = a / math.sqrt(1.0 - e2 * sin_lat * sin_lat)
-    x = (n + h_m) * cos_lat * cos_lon
-    y = (n + h_m) * cos_lat * sin_lon
-    z = (n * (1.0 - e2) + h_m) * sin_lat
-    return np.array([x, y, z], dtype=np.float64)
-
-
-def ecef_to_enu_matrix(lat_deg, lon_deg):
-    lat = math.radians(lat_deg)
-    lon = math.radians(lon_deg)
-    sin_lat = math.sin(lat)
-    cos_lat = math.cos(lat)
-    sin_lon = math.sin(lon)
-    cos_lon = math.cos(lon)
-    return np.array(
-        [[-sin_lon, cos_lon, 0.0],
-         [-sin_lat * cos_lon, -sin_lat * sin_lon, cos_lat],
-         [cos_lat * cos_lon, cos_lat * sin_lon, sin_lat]],
-        dtype=np.float64,
-    )
-
-
-def ecef_to_geodetic(ecef):
-    """Zhu 1994 closed-form ECEF → (lat_deg, lon_deg, height_m)."""
-    x, y, z = float(ecef[0]), float(ecef[1]), float(ecef[2])
-    a, b = 6378137.0, 6356752.3142
-    e2 = 1.0 - (b / a) ** 2
-    ep2 = (a / b) ** 2 - 1.0
-    p = math.sqrt(x * x + y * y)
-    theta = math.atan2(z * a, p * b)
-    lat = math.atan2(z + ep2 * b * math.sin(theta) ** 3,
-                     p - e2 * a * math.cos(theta) ** 3)
-    lon = math.atan2(y, x)
-    sin_lat = math.sin(lat)
-    N = a / math.sqrt(1.0 - e2 * sin_lat * sin_lat)
-    cos_lat = math.cos(lat)
-    h = (p / cos_lat - N) if abs(cos_lat) > 1e-6 else (abs(z) / abs(sin_lat) - N * (1.0 - e2))
-    return math.degrees(lat), math.degrees(lon), h
-
-
-def enu_to_geodetic_batch(pts_enu, ecef_origin, enu_from_ecef):
-    """pts_enu: (N, 3). Returns (N, 3) lat/lon/h."""
-    ecef_from_enu = enu_from_ecef.T
-    pts_ecef = (ecef_from_enu @ np.asarray(pts_enu).T).T + ecef_origin
-    out = np.zeros_like(pts_ecef)
-    for i, e in enumerate(pts_ecef):
-        out[i] = ecef_to_geodetic(e)
-    return out
+from core.geometry import (  # noqa: E402
+    ecef_to_enu_matrix,
+    enu_to_geodetic_batch,
+    geodetic_to_ecef,
+)
 
 
 def parse_args():

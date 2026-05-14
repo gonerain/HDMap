@@ -16,11 +16,17 @@ Outputs:
 """
 import argparse
 import json
+import os
+import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
 from shapely.geometry import LineString, MultiPoint, Point, Polygon
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from core.geometry import world_to_canvas  # noqa: E402
 
 
 def parse_args():
@@ -94,13 +100,6 @@ def measure_normal(p, n_vec, polygon, ray_length):
     dists = np.linalg.norm(coords - p, axis=1)
     k = int(np.argmin(dists))
     return float(dists[k]), coords[k]
-
-
-def world_to_canvas(pts_xy, x_min, y_min, res, h_px):
-    pts = np.atleast_2d(np.asarray(pts_xy, dtype=np.float64))
-    col = ((pts[:, 0] - x_min) / res).astype(np.int32)
-    row = (h_px - 1 - (pts[:, 1] - y_min) / res).astype(np.int32)
-    return np.column_stack([col, row])
 
 
 def main():

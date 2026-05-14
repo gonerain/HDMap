@@ -10,12 +10,18 @@ renders one image with TWO panels:
 """
 import argparse
 import json
-import pickle
+import os
+import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
 from scipy.spatial import cKDTree
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from core.geometry import world_to_canvas  # noqa: E402
+from core.pkl_io import load_frames  # noqa: E402
 
 
 def parse_args():
@@ -33,17 +39,6 @@ def parse_args():
     p.add_argument("--bev-res-m", type=float, default=0.1)
     p.add_argument("--margin-m", type=float, default=2.0)
     return p.parse_args()
-
-
-def load_pkl(path):
-    frames = []
-    with open(path, "rb") as f:
-        while True:
-            try:
-                frames.append(np.asarray(pickle.load(f), dtype=np.float64))
-            except EOFError:
-                break
-    return frames
 
 
 def augment_frame(arr, walkers_xy, sw_class, person_class,
@@ -72,16 +67,9 @@ def augment_frame(arr, walkers_xy, sw_class, person_class,
     return real_xy, virtual_xy
 
 
-def world_to_canvas(pts_xy, x_min, y_min, res, h_px):
-    pts = np.atleast_2d(np.asarray(pts_xy, dtype=np.float64))
-    col = ((pts[:, 0] - x_min) / res).astype(np.int32)
-    row = (h_px - 1 - (pts[:, 1] - y_min) / res).astype(np.int32)
-    return np.column_stack([col, row])
-
-
 def main():
     args = parse_args()
-    frames = load_pkl(args.pkl)
+    frames = load_frames(args.pkl)
     poses = np.loadtxt(args.pose, delimiter=",")
     if poses.ndim == 1:
         poses = poses.reshape(1, -1)

@@ -15,10 +15,16 @@ Output: PNG chart with raw vs smoothed width curve + JSON sidecar with
 """
 import argparse
 import json
+import os
+import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from core.geometry import world_to_canvas  # noqa: E402
 
 
 def parse_args():
@@ -35,13 +41,6 @@ def parse_args():
     p.add_argument("--bev-res-m", type=float, default=0.05)
     p.add_argument("--margin-m", type=float, default=2.0)
     return p.parse_args()
-
-
-def world_to_canvas(pts_xy, x_min, y_min, res, h_px):
-    pts = np.atleast_2d(np.asarray(pts_xy, dtype=np.float64))
-    col = ((pts[:, 0] - x_min) / res).astype(np.int32)
-    row = (h_px - 1 - (pts[:, 1] - y_min) / res).astype(np.int32)
-    return np.column_stack([col, row])
 
 
 def render_bev(measurements, w_smooth, records_path, sidewalk_index,

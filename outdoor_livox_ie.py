@@ -24,6 +24,19 @@ from sensor_msgs.msg import PointCloud2
 from tf.transformations import quaternion_from_matrix
 
 import predict
+from core.extrinsics import (
+    R_BASE_FROM_LIDAR,
+    R_BASE_FROM_SPAN,
+    R_LIDAR_FROM_BASE,
+    T_BASE_FROM_LIDAR_M,
+    T_BASE_FROM_SPAN_M,
+    T_FLU_LIDAR_FROM_SPAN,
+)
+from core.geometry import (
+    ecef_to_enu_matrix,
+    ecef_to_geodetic as _ecef_to_geodetic,
+    geodetic_to_ecef,
+)
 from util import bri
 from util import get_colors
 from util import get_i_pcd_msg
@@ -215,24 +228,6 @@ def lerp_angle_deg(a_deg, b_deg, alpha):
     return a + delta * float(alpha)
 
 
-def _ecef_to_geodetic(ecef):
-    """Zhu 1994 closed-form ECEF → (lat_deg, lon_deg, height_m)."""
-    x, y, z = float(ecef[0]), float(ecef[1]), float(ecef[2])
-    a, b = 6378137.0, 6356752.3142
-    e2 = 1.0 - (b / a) ** 2
-    ep2 = (a / b) ** 2 - 1.0
-    p = math.sqrt(x * x + y * y)
-    theta = math.atan2(z * a, p * b)
-    lat = math.atan2(z + ep2 * b * math.sin(theta) ** 3,
-                     p - e2 * a * math.cos(theta) ** 3)
-    lon = math.atan2(y, x)
-    sin_lat = math.sin(lat)
-    N = a / math.sqrt(1.0 - e2 * sin_lat * sin_lat)
-    cos_lat = math.cos(lat)
-    h = (p / cos_lat - N) if abs(cos_lat) > 1e-6 else (abs(z) / abs(sin_lat) - N * (1.0 - e2))
-    return math.degrees(lat), math.degrees(lon), h
-
-
 def _euler_zyx_to_matrix(roll_deg, pitch_deg, yaw_deg):
     """ZYX active rotation matrix R_world_from_body from FAST-LIO2 Euler angles."""
     r = math.radians(roll_deg)
@@ -406,35 +401,6 @@ def pose_enu_from_geodetic_batch(lat_deg, lon_deg, h_m, ecef_origin, enu_from_ec
     return (ecef - ecef_origin[None, :]) @ enu_from_ecef.T
 
 
-def geodetic_to_ecef(lat_deg, lon_deg, h_m):
-    a = 6378137.0
-    e2 = 6.69437999014e-3
-    lat = deg2rad(lat_deg)
-    lon = deg2rad(lon_deg)
-    sin_lat = math.sin(lat)
-    cos_lat = math.cos(lat)
-    sin_lon = math.sin(lon)
-    cos_lon = math.cos(lon)
-    n = a / math.sqrt(1.0 - e2 * sin_lat * sin_lat)
-    x = (n + h_m) * cos_lat * cos_lon
-    y = (n + h_m) * cos_lat * sin_lon
-    z = (n * (1.0 - e2) + h_m) * sin_lat
-    return np.array([x, y, z], dtype=np.float64)
-
-
-def ecef_to_enu_matrix(lat_deg, lon_deg):
-    lat = deg2rad(lat_deg)
-    lon = deg2rad(lon_deg)
-    sin_lat = math.sin(lat)
-    cos_lat = math.cos(lat)
-    sin_lon = math.sin(lon)
-    cos_lon = math.cos(lon)
-    return np.array(
-        [[-sin_lon, cos_lon, 0.0], [-sin_lat * cos_lon, -sin_lat * sin_lon, cos_lat], [cos_lat * cos_lon, cos_lat * sin_lon, sin_lat]],
-        dtype=np.float64,
-    )
-
-
 def pose_enu_from_ie(ie_pose, ecef_origin, enu_from_ecef):
     ecef = geodetic_to_ecef(ie_pose.latitude_deg, ie_pose.longitude_deg, ie_pose.height_m)
     return enu_from_ecef @ (ecef - ecef_origin)
@@ -448,24 +414,15 @@ def ie_pose_to_quaternion_xyzw(ie_pose):
     return np.asarray(q, dtype=np.float64)
 
 
-# base<-lidar and base<-span, copied from /mnt/ning_602/work/tracking
-# (configs/lidar_config.yaml, ie_lidar_extrinsics block). base/body is FLU.
-# Tracking calibrates span as RFU (per the "FLU->RFU" comment in the YAML
-# and the SPAN convention used by NovAtel IE).
-R_BASE_FROM_LIDAR = np.array([[0.9063, 0.0, 0.4226], [0.0, 1.0, 0.0], [-0.4226, 0.0, 0.9063]], dtype=np.float64)
-T_BASE_FROM_LIDAR_M = np.array([0.0315, 0.0, 0.1314], dtype=np.float64)
-R_BASE_FROM_SPAN = np.array([[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
-T_BASE_FROM_SPAN_M = np.array([-0.1854, 0.0, -0.242], dtype=np.float64)
-R_LIDAR_FROM_BASE = R_BASE_FROM_LIDAR.T
-
-# Lidar position in the IE body frame (FLU axes, **origin at SPAN antenna**)
-# = base->lidar position minus base->span position. This matches both the
-# tracking project's chain `R_SPAN_FROM_LIDAR @ p + T_SPAN_FROM_LIDAR_M`
-# followed by FLU<-RFU axis swap, and the convention used by NovAtel IE
-# poses (the lat/lon/h reported by IE is the antenna position, so the
-# body origin must also be the antenna for `p_world = R @ p_body + t_enu`
-# to be self-consistent — see doc/coordinate_transforms.md).
-T_FLU_LIDAR_FROM_SPAN = T_BASE_FROM_LIDAR_M - T_BASE_FROM_SPAN_M
+# base<-lidar / base<-span extrinsic constants now live in
+# `core/extrinsics.py` (imported above as R_BASE_FROM_LIDAR etc.). Keeping
+# this comment as a pointer so future readers find the single source.
+#
+# Lidar position in the IE body frame (FLU axes, origin at SPAN antenna):
+#   T_FLU_LIDAR_FROM_SPAN = T_BASE_FROM_LIDAR_M - T_BASE_FROM_SPAN_M
+# is imported (not recomputed) so changing the constants in one place
+# updates every downstream tool. See doc/coordinate_transforms.md for the
+# IE/SPAN antenna-origin convention.
 
 
 def lidar_to_ie_body(points_lidar_xyz):

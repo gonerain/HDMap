@@ -17,13 +17,19 @@ plus a JSON sidecar with the polyline edges.
 """
 import argparse
 import json
-import pickle
+import os
+import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
 from scipy.spatial import Voronoi
-from shapely.geometry import Polygon, Point, MultiPolygon
+from shapely.geometry import MultiPolygon, Point, Polygon
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from core.geometry import quat_to_rotmat, world_to_canvas  # noqa: E402
+from core.pkl_io import load_frames  # noqa: E402
 
 
 def parse_args():
@@ -60,24 +66,6 @@ def parse_args():
                    help="If > 0, resample trunk by arclength at this spacing (m). "
                         "0 disables (raw trunk vertices kept).")
     return p.parse_args()
-
-
-def quat_to_rotmat(qx, qy, qz, qw):
-    n = float(qx * qx + qy * qy + qz * qz + qw * qw)
-    if n < 1e-12:
-        return np.eye(3, dtype=np.float64)
-    s = 2.0 / n
-    xx, yy, zz = qx * qx * s, qy * qy * s, qz * qz * s
-    xy, xz, yz = qx * qy * s, qx * qz * s, qy * qz * s
-    wx, wy, wz = qw * qx * s, qw * qy * s, qw * qz * s
-    return np.array(
-        [
-            [1.0 - (yy + zz), xy - wz, xz + wy],
-            [xy + wz, 1.0 - (xx + zz), yz - wx],
-            [xz - wy, yz + wx, 1.0 - (xx + yy)],
-        ],
-        dtype=np.float64,
-    )
 
 
 def pose_forward_xy(pose_row):
@@ -300,13 +288,6 @@ def medial_axis(poly, boundary_samples, lambda_min):
     return raw, kept
 
 
-def world_to_canvas(pts_xy, x_min, y_min, res, h_px):
-    pts = np.atleast_2d(np.asarray(pts_xy, dtype=np.float64))
-    col = ((pts[:, 0] - x_min) / res).astype(np.int32)
-    row = (h_px - 1 - (pts[:, 1] - y_min) / res).astype(np.int32)
-    return np.column_stack([col, row])
-
-
 def lam_color(lam, lam_max):
     """Cool-warm: thin = blue, wide = red. Returns BGR."""
     t = float(np.clip(lam / max(lam_max, 1e-6), 0, 1))
@@ -395,13 +376,7 @@ def main():
 
     # Optional LiDAR underlay
     if args.pkl:
-        frames = []
-        with open(args.pkl, "rb") as f:
-            while True:
-                try:
-                    frames.append(np.asarray(pickle.load(f), dtype=np.float64))
-                except EOFError:
-                    break
+        frames = load_frames(args.pkl)
         all_pts = []
         for arr in frames:
             if arr is None or len(arr) == 0:

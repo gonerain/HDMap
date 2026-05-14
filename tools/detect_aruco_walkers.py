@@ -12,21 +12,20 @@ in the same frame are promoted to virtual sidewalk points.
 """
 import argparse
 import json
+import os
+import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
 
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-# Same constants as the rest of the pipeline.
-R_BASE_FROM_LIDAR = np.array(
-    [[0.9063, 0.0, 0.4226], [0.0, 1.0, 0.0], [-0.4226, 0.0, 0.9063]],
-    dtype=np.float64,
+from core.geometry import (  # noqa: E402
+    cam_extrinsics_from_config,
+    normalize_camera_model,
+    quat_to_rotmat,
 )
-T_BASE_FROM_LIDAR_M = np.array([0.0315, 0.0, 0.1314], dtype=np.float64)
-T_BASE_FROM_SPAN_M = np.array([-0.1854, 0.0, -0.242], dtype=np.float64)
-R_LIDAR_FROM_BASE = R_BASE_FROM_LIDAR.T
-T_FLU_LIDAR_FROM_SPAN = T_BASE_FROM_LIDAR_M - T_BASE_FROM_SPAN_M
 
 
 ARUCO_DICT_MAP = {
@@ -52,24 +51,6 @@ def parse_args():
     p.add_argument("--start", type=int, default=1)
     p.add_argument("--end", type=int, default=None)
     return p.parse_args()
-
-
-def quat_to_rotmat(qx, qy, qz, qw):
-    n = float(qx * qx + qy * qy + qz * qz + qw * qw)
-    if n < 1e-12:
-        return np.eye(3, dtype=np.float64)
-    s = 2.0 / n
-    xx, yy, zz = qx * qx * s, qy * qy * s, qz * qz * s
-    xy, xz, yz = qx * qy * s, qx * qz * s, qy * qz * s
-    wx, wy, wz = qw * qx * s, qw * qy * s, qw * qz * s
-    return np.array(
-        [
-            [1.0 - (yy + zz), xy - wz, xz + wy],
-            [xy + wz, 1.0 - (xx + zz), yz - wx],
-            [xz - wy, yz + wx, 1.0 - (xx + yy)],
-        ],
-        dtype=np.float64,
-    )
 
 
 def pose_to_world_from_cam(pose_row, R_bc, t_bc):
@@ -119,16 +100,9 @@ def main():
     cfg = json.load(open(args.config))
     K = np.asarray(cfg["intrinsic"], dtype=np.float64).reshape(3, 3)
     D = np.asarray(cfg["distortion_matrix"], dtype=np.float64).reshape(-1, 1)
-    model = str(cfg.get("camera_model", "pinhole")).lower()
-    if model in {"fisheye", "equidistantcamera"}:
-        model = "equidistant"
+    model = normalize_camera_model(cfg.get("camera_model"))
 
-    R_lc = np.asarray(cfg["lidar_from_camera_rotation"], dtype=np.float64).reshape(3, 3)
-    t_lc = np.asarray(cfg["lidar_from_camera_translation"], dtype=np.float64).reshape(3)
-    R_cl = R_lc.T
-    t_cl = -R_lc.T @ t_lc
-    R_cb = R_cl @ R_LIDAR_FROM_BASE
-    t_cb = t_cl - R_cb @ T_FLU_LIDAR_FROM_SPAN
+    R_cb, t_cb = cam_extrinsics_from_config(cfg)
     R_bc = R_cb.T
     t_bc = -R_cb.T @ t_cb
 

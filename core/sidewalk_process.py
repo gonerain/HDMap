@@ -142,18 +142,12 @@ class SidewalkEdgeProcess(VectorProcess):
     fused_outline_open_buffer = 0.0
     fused_min_area = 2.0
     fused_min_support_frames = 3
-    bev_res = 0.15
-    bev_min_frames = 3
-    bev_min_sidewalk_fraction = 0.5
-    bev_grid_cap = 4_000_000
-    # Default back to the 803a0e1 alpha-shape pipeline. The BEV temporal-vote
-    # path was a regression on the 0421-AM bag (polygons shrink below the
-    # actual sidewalk extent) — restore the older, simpler chain as the
-    # default and keep the BEV code reachable behind explicit config flags.
+    # Default to the 803a0e1 alpha-shape pipeline. The historical BEV
+    # temporal-voting path (`use_bev_vote`, `_bev_temporal_vote`,
+    # bev_min_* etc.) was a regression on the 0421-AM bag and is removed.
     outline_method = "alpha"
     outline_bev_res = 0.15
     outline_bev_dilate_px = 1
-    use_bev_vote = False
     # Voxel-downsample the per-cluster point set before alpha-shape. With the
     # body-origin fix the per-frame sidewalk class is dense (~1.5k pts/frame
     # × 10-frame window → 5k-15k pts per cluster), and alphashape on raw
@@ -198,31 +192,14 @@ class SidewalkEdgeProcess(VectorProcess):
         self.min_compactness = float(config.get("sidewalk_cluster_min_compactness", 0.004))
         self.max_center_distance = float(config.get("sidewalk_cluster_max_center_distance", 45.0))
 
-        # Phase A.2: BEV temporal voting on the sliding window of full-class
-        # point clouds. A cell becomes a "stable sidewalk cell" only when at
-        # least `bev_min_frames` distinct frames in the window saw sidewalk
-        # there AND the per-cell sidewalk fraction (sidewalk-frames /
-        # any-class-frames) is at least `bev_min_sidewalk_fraction`. The
-        # representative point per cell is its center with the mean Z of the
-        # contributing sidewalk hits. See doc/sidewalk_vectorization_roadmap.md.
-        self.bev_res = float(config.get("sidewalk_bev_res", self.bev_res))
-        self.bev_min_frames = max(int(config.get("sidewalk_bev_min_frames", self.bev_min_frames)), 1)
-        self.bev_min_sidewalk_fraction = float(
-            config.get("sidewalk_bev_min_sidewalk_fraction", self.bev_min_sidewalk_fraction)
-        )
-        self.bev_grid_cap = max(int(config.get("sidewalk_bev_grid_cap", self.bev_grid_cap)), 10_000)
-        self.full_history = FixedQueue(2 * self.dirc_window + self.window_size)
-
-        # Phase 1.1: BEV-contour outline replaces alpha-shape. Both the
-        # per-frame outline and the per-track final outline use this. Set
-        # `sidewalk_outline_method = "alpha"` to fall back to alphashape
-        # for A/B comparison.
+        # Outline construction method: "alpha" (default, alpha-shape on the
+        # cluster's points) or "bev" (rasterized contour with morphological
+        # dilation, see `outline_bev_*` knobs).
         self.outline_method = str(config.get("sidewalk_outline_method", self.outline_method)).lower()
         if self.outline_method not in {"bev", "alpha"}:
             raise ValueError(f"sidewalk_outline_method must be 'bev' or 'alpha', got {self.outline_method!r}")
         self.outline_bev_res = float(config.get("sidewalk_outline_bev_res", self.outline_bev_res))
         self.outline_bev_dilate_px = max(int(config.get("sidewalk_outline_bev_dilate_px", self.outline_bev_dilate_px)), 0)
-        self.use_bev_vote = bool(config.get("sidewalk_use_bev_vote", self.use_bev_vote))
         self.alpha_input_voxel = float(config.get("sidewalk_alpha_input_voxel", self.alpha_input_voxel))
         self.alpha_input_max_points = max(int(config.get("sidewalk_alpha_input_max_points", self.alpha_input_max_points)), 0)
         self.person_class_id = int(config.get("sidewalk_person_class_id",
@@ -294,115 +271,13 @@ class SidewalkEdgeProcess(VectorProcess):
 
     def ingest_frame(self, sempcd):
         self._frame_index_counter += 1
-        # Base class drops everything but the target class; Phase A.2 needs
-        # the *full* per-frame cloud so the BEV vote can compute the per-cell
-        # sidewalk fraction. Keep both queues in lockstep so window slicing
-        # in process() lines up with the base class context — but only when
-        # BEV voting is on. Otherwise full_history just burns RAM and
-        # per-frame copies (~50 frames × full cloud each).
         if sempcd is None or len(sempcd) == 0:
-            empty = np.zeros((0, 4), dtype=np.float32)
-            self.history.append(empty)
-            if self.use_bev_vote:
-                self.full_history.append(empty)
+            self.history.append(np.zeros((0, 4), dtype=np.float32))
             return
         sempcd = np.asarray(sempcd, dtype=np.float32)
         sempcd = self._augment_with_person_proxy(sempcd, self._frame_index_counter)
         self.history.append(sempcd[sempcd[:, 3] == self.target_class])
-        if self.use_bev_vote:
-            self.full_history.append(sempcd)
 
-    def _bev_temporal_vote(self, full_frames):
-        """Reduce a temporal window of full-class point clouds to one
-        representative point per stable sidewalk cell.
-
-        A cell is kept iff:
-          * sidewalk_frame_count[cell] >= self.bev_min_frames
-          * sidewalk_frame_count[cell] / total_frame_count[cell]
-            >= self.bev_min_sidewalk_fraction
-
-        Returns an (M, 3) float32 array of (x, y, mean_sidewalk_z).
-        """
-        sidewalk_class = int(self.target_class)
-        non_empty = [np.asarray(f, dtype=np.float32) for f in full_frames if len(f) > 0]
-        if not non_empty:
-            return np.zeros((0, 3), dtype=np.float32)
-
-        all_xy = np.concatenate([f[:, :2] for f in non_empty], axis=0)
-        if len(all_xy) == 0:
-            return np.zeros((0, 3), dtype=np.float32)
-
-        res = float(self.bev_res)
-        if res <= 0.0:
-            return np.zeros((0, 3), dtype=np.float32)
-
-        xy_min = all_xy.min(axis=0).astype(np.float64)
-        xy_max = all_xy.max(axis=0).astype(np.float64)
-        grid_w = int(np.ceil((xy_max[0] - xy_min[0]) / res)) + 1
-        grid_h = int(np.ceil((xy_max[1] - xy_min[1]) / res)) + 1
-        if grid_w <= 0 or grid_h <= 0 or grid_w * grid_h > self.bev_grid_cap:
-            # Degenerate or pathological window — fall back to raw sidewalk
-            # points so we never silently drop a frame.
-            sidewalk_pts = [f[f[:, 3] == sidewalk_class, :3] for f in non_empty]
-            sidewalk_pts = [p for p in sidewalk_pts if len(p) > 0]
-            if not sidewalk_pts:
-                return np.zeros((0, 3), dtype=np.float32)
-            return np.vstack(sidewalk_pts).astype(np.float32, copy=False)
-
-        sidewalk_frame_count = np.zeros((grid_h, grid_w), dtype=np.int32)
-        total_frame_count = np.zeros((grid_h, grid_w), dtype=np.int32)
-        z_sum = np.zeros((grid_h, grid_w), dtype=np.float64)
-        z_count = np.zeros((grid_h, grid_w), dtype=np.int32)
-
-        for frame in non_empty:
-            col_all = ((frame[:, 0].astype(np.float64) - xy_min[0]) / res).astype(np.int64)
-            row_all = ((frame[:, 1].astype(np.float64) - xy_min[1]) / res).astype(np.int64)
-            np.clip(col_all, 0, grid_w - 1, out=col_all)
-            np.clip(row_all, 0, grid_h - 1, out=row_all)
-
-            cell_all = row_all * grid_w + col_all
-            unique_all = np.unique(cell_all)
-            ur = (unique_all // grid_w).astype(np.int32)
-            uc = (unique_all % grid_w).astype(np.int32)
-            total_frame_count[ur, uc] += 1
-
-            mask_sw = frame[:, 3] == sidewalk_class
-            if not mask_sw.any():
-                continue
-            cell_sw = cell_all[mask_sw]
-            unique_sw = np.unique(cell_sw)
-            sr = (unique_sw // grid_w).astype(np.int32)
-            sc = (unique_sw % grid_w).astype(np.int32)
-            sidewalk_frame_count[sr, sc] += 1
-
-            sw_pts = frame[mask_sw]
-            sw_row = row_all[mask_sw].astype(np.int32)
-            sw_col = col_all[mask_sw].astype(np.int32)
-            np.add.at(z_sum, (sw_row, sw_col), sw_pts[:, 2].astype(np.float64))
-            np.add.at(z_count, (sw_row, sw_col), 1)
-
-        if not (sidewalk_frame_count > 0).any():
-            return np.zeros((0, 3), dtype=np.float32)
-
-        with np.errstate(invalid="ignore", divide="ignore"):
-            fraction = np.where(
-                total_frame_count > 0,
-                sidewalk_frame_count / np.maximum(total_frame_count, 1),
-                0.0,
-            )
-
-        keep = (sidewalk_frame_count >= int(self.bev_min_frames)) & (
-            fraction >= float(self.bev_min_sidewalk_fraction)
-        )
-        if not keep.any():
-            return np.zeros((0, 3), dtype=np.float32)
-
-        rows, cols = np.where(keep)
-        z_safe = z_count[rows, cols]
-        cz = np.where(z_safe > 0, z_sum[rows, cols] / np.maximum(z_safe, 1), 0.0)
-        cx = (cols.astype(np.float64) + 0.5) * res + xy_min[0]
-        cy = (rows.astype(np.float64) + 0.5) * res + xy_min[1]
-        return np.column_stack([cx, cy, cz]).astype(np.float32)
 
     def _extract_outline_bev(self, points_xyz):
         """Outline extraction for the voted-cell point sets produced by A.2.
@@ -582,21 +457,11 @@ class SidewalkEdgeProcess(VectorProcess):
             return False
 
         # 803a0e1 default: cluster on the raw class-15 window points; let
-        # DBSCAN + score-based filtering reject the noise. The BEV temporal-
-        # voting path is reachable by setting `sidewalk_use_bev_vote: true`
-        # for A/B comparison — by default it shrinks polygons below the real
-        # sidewalk extent, so we don't run it here.
-        if self.use_bev_vote:
-            full_window = list(self.full_history[self.dirc_window:(self.dirc_window + self.window_size)])
-            merged_points = self._bev_temporal_vote(full_window)
-            if len(merged_points) == 0:
-                print(f"skip: BEV vote produced no stable sidewalk cells @ {logical_index}")
-                return False
-        else:
-            merged_points = process_ctx["current_points"]
-            if len(merged_points) == 0:
-                print(f"skip: empty class-{self.target_class} window @ {logical_index}")
-                return False
+        # DBSCAN + score-based filtering reject the noise.
+        merged_points = process_ctx["current_points"]
+        if len(merged_points) == 0:
+            print(f"skip: empty class-{self.target_class} window @ {logical_index}")
+            return False
 
         results = self.extract_candidate_outlines(merged_points, process_ctx["current_center"])
         if not results:

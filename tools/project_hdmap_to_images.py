@@ -7,21 +7,22 @@ visualization stays meaningful (far points get arbitrarily distorted).
 """
 import argparse
 import json
-import pickle
+import os
+import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
 
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-R_BASE_FROM_LIDAR = np.array(
-    [[0.9063, 0.0, 0.4226], [0.0, 1.0, 0.0], [-0.4226, 0.0, 0.9063]],
-    dtype=np.float64,
+from core.geometry import (  # noqa: E402
+    cam_extrinsics_from_config,
+    normalize_camera_model,
+    pose_to_cam_world,
+    project_world_to_image,
 )
-T_BASE_FROM_LIDAR_M = np.array([0.0315, 0.0, 0.1314], dtype=np.float64)
-T_BASE_FROM_SPAN_M = np.array([-0.1854, 0.0, -0.242], dtype=np.float64)
-R_LIDAR_FROM_BASE = R_BASE_FROM_LIDAR.T
-T_FLU_LIDAR_FROM_SPAN = T_BASE_FROM_LIDAR_M - T_BASE_FROM_SPAN_M
+from core.pkl_io import load_frames  # noqa: E402
 
 
 def parse_args():
@@ -56,48 +57,10 @@ def parse_args():
     return p.parse_args()
 
 
-def quat_to_rotmat(qx, qy, qz, qw):
-    n = float(qx * qx + qy * qy + qz * qz + qw * qw)
-    if n < 1e-12:
-        return np.eye(3, dtype=np.float64)
-    s = 2.0 / n
-    xx, yy, zz = qx * qx * s, qy * qy * s, qz * qz * s
-    xy, xz, yz = qx * qy * s, qx * qz * s, qy * qz * s
-    wx, wy, wz = qw * qx * s, qw * qy * s, qw * qz * s
-    return np.array(
-        [
-            [1.0 - (yy + zz), xy - wz, xz + wy],
-            [xy + wz, 1.0 - (xx + zz), yz - wx],
-            [xz - wy, yz + wx, 1.0 - (xx + yy)],
-        ],
-        dtype=np.float64,
-    )
-
-
-def pose_to_cam_world(pose_row, R_cb, t_cb):
-    tx, ty, tz, qx, qy, qz, qw = pose_row
-    R_wb = quat_to_rotmat(qx, qy, qz, qw)
-    t_wb = np.array([tx, ty, tz], dtype=np.float64)
-    R_bw = R_wb.T
-    t_bw = -R_bw @ t_wb
-    R_cw = R_cb @ R_bw
-    t_cw = R_cb @ t_bw + t_cb
-    return R_cw, t_cw
-
-
 def project(points_world, R_cw, t_cw, K, D, model):
-    cam = (R_cw @ points_world.T).T + t_cw
-    front = cam[:, 2] > 0.05
-    pix = np.full((len(points_world), 2), np.nan, dtype=np.float64)
-    if front.any():
-        pts = cam[front].reshape(-1, 1, 3)
-        zero = np.zeros((3, 1), dtype=np.float64)
-        if model == "equidistant":
-            out, _ = cv2.fisheye.projectPoints(pts, zero, zero, K, D)
-        else:
-            out, _ = cv2.projectPoints(pts, zero, zero, K, D)
-        pix[front] = out.reshape(-1, 2)
-    return pix, cam[:, 2]
+    """Local 2-arg wrapper kept for the tool's legacy call sites."""
+    uv, _valid, z = project_world_to_image(points_world, R_cw, t_cw, K, D, model)
+    return uv, z
 
 
 def main():
@@ -105,18 +68,11 @@ def main():
     cfg = json.load(open(args.config))
     K = np.asarray(cfg["intrinsic"], dtype=np.float64).reshape(3, 3)
     D = np.asarray(cfg["distortion_matrix"], dtype=np.float64).reshape(-1, 1)
-    model = str(cfg.get("camera_model", "pinhole")).lower()
-    if model in {"fisheye", "equidistantcamera"}:
-        model = "equidistant"
+    model = normalize_camera_model(cfg.get("camera_model"))
     if args.camera_model is not None:
         model = args.camera_model.lower()
 
-    R_lc = np.asarray(cfg["lidar_from_camera_rotation"], dtype=np.float64).reshape(3, 3)
-    t_lc = np.asarray(cfg["lidar_from_camera_translation"], dtype=np.float64).reshape(3)
-    R_cl = R_lc.T
-    t_cl = -R_lc.T @ t_lc
-    R_cb = R_cl @ R_LIDAR_FROM_BASE
-    t_cb = t_cl - R_cb @ T_FLU_LIDAR_FROM_SPAN
+    R_cb, t_cb = cam_extrinsics_from_config(cfg)
 
     records = json.load(open(args.records))
     sidewalks = records.get("sidewalks", [])
@@ -161,13 +117,7 @@ def main():
 
     frames_pkl = None
     if args.pkl:
-        frames_pkl = []
-        with open(args.pkl, "rb") as f:
-            while True:
-                try:
-                    frames_pkl.append(np.asarray(pickle.load(f), dtype=np.float64))
-                except EOFError:
-                    break
+        frames_pkl = load_frames(args.pkl)
         print(f"loaded {len(frames_pkl)} pkl frames")
 
     fids = list(range(start, end + 1, int(args.stride)))
