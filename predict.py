@@ -23,7 +23,14 @@ def get_colors(cmap = 'mapillary'):
     if cmap == 'cityscapes':
         return create_cityscapes_label_colormap()
 
-def get_predict_func_detectron(conf_file, model_file, device=None):
+def get_predict_func_detectron(conf_file, model_file, device=None, class_margin_min=None):
+    """`class_margin_min`: optional `{class_id: min_margin}`. For each listed
+    class, the predicted pixel is kept only if its softmax score beats the
+    runner-up by at least `min_margin`. Halo pixels around persons (where
+    sidewalk barely beats person) get rejected; confident interiors are
+    unaffected. Pixels that fail the margin test are relabeled to 0
+    (SEG_BACKGROUND_CLASS), which downstream class-id filters ignore.
+    """
     opts = ['MODEL.WEIGHTS', model_file]
     if device is None:
         device = os.environ.get("HDMAP_PREDICT_DEVICE")
@@ -39,12 +46,34 @@ def get_predict_func_detectron(conf_file, model_file, device=None):
     if str(cfg.MODEL.DEVICE).startswith("cuda") and torch.cuda.is_available():
         torch.cuda.empty_cache()
     predictor_base = DefaultPredictor(cfg)
+    if class_margin_min:
+        gate_ids = torch.tensor(
+            [int(k) for k in class_margin_min.keys()], dtype=torch.long
+        )
+        gate_thr = torch.tensor(
+            [float(v) for v in class_margin_min.values()], dtype=torch.float32
+        )
+    else:
+        gate_ids = None
+        gate_thr = None
+
     def predictor(img):
-        simg = predictor_base(img)
-        simg = simg['sem_seg']
-        simg[simg<0.5]=0
-        cimg = simg.argmax(axis=0).cpu().numpy().astype('uint8')
-        return cimg
+        simg = predictor_base(img)['sem_seg']  # (C, H, W), post-softmax
+        if gate_ids is None:
+            # Legacy path: per-class score floor of 0.5 then argmax.
+            simg = simg.clone()
+            simg[simg < 0.5] = 0
+            return simg.argmax(axis=0).cpu().numpy().astype('uint8')
+        cimg = simg.argmax(axis=0)
+        top2 = simg.topk(2, dim=0).values
+        margin = top2[0] - top2[1]
+        ids = gate_ids.to(simg.device)
+        thrs = gate_thr.to(simg.device)
+        for cls_id, thr in zip(ids, thrs):
+            bad = (cimg == cls_id) & (margin < thr)
+            if bool(bad.any()):
+                cimg[bad] = 0
+        return cimg.cpu().numpy().astype('uint8')
     return predictor
 
 def get_predict_func_mmsegmentation(conf_file,model_file):

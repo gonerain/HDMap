@@ -4,6 +4,8 @@
     "start_time": 0,
     "play_time": -1,
     "LiDAR_topic": "/lidar",
+    "imu_topic": "/imu",
+    "dedistort_method": "imu",
     "camera_topic": "/front_camera/image/compressed",
     "image_compressed": true,
     "max_sync_dt": 0.12,
@@ -13,17 +15,50 @@
     "predict_image_scale": 0.75,
     "camera_model": "equidistant",
     "intrinsic": [
-        [464.8906509662917, 0.0, 631.6777733624097],
-        [0.0, 465.0582538242402, 523.4363256680425],
-        [0.0, 0.0, 1.0]
+        [
+            464.8906509662917,
+            0.0,
+            631.6777733624097
+        ],
+        [
+            0.0,
+            465.0582538242402,
+            523.4363256680425
+        ],
+        [
+            0.0,
+            0.0,
+            1.0
+        ]
     ],
-    "distortion_matrix": [-0.017366953282639, 0.000574174219028, -0.00154438708609, 0.000549409825028],
+    "distortion_matrix": [
+        -0.017366953282639,
+        0.000574174219028,
+        -0.00154438708609,
+        0.000549409825028
+    ],
     "lidar_from_camera_rotation": [
-        [-0.0248760658442102,  0.4141228407617354,  0.9098810109610734],
-        [-0.9996892397064623, -0.008835361707340894, -0.0233100922052239],
-        [-0.001614113759963343, -0.9101781194595544,  0.4142139368657687]
+        [
+            -0.0248760658442102,
+            0.4141228407617354,
+            0.9098810109610734
+        ],
+        [
+            -0.9996892397064623,
+            -0.008835361707340894,
+            -0.0233100922052239
+        ],
+        [
+            -0.001614113759963343,
+            -0.9101781194595544,
+            0.4142139368657687
+        ]
     ],
-    "lidar_from_camera_translation": [0.051401176491, 0.015593452288, -0.06077996213],
+    "lidar_from_camera_translation": [
+        0.051401176491,
+        0.015593452288,
+        -0.06077996213
+    ],
     "save_folder": "result/outdoor",
     "mode": "outdoor",
     "model_config": "imseg/mask2former/config/swin/maskformer2_swin_large_IN21k_384_bs16_300k.yaml",
@@ -34,16 +69,45 @@
     "sidewalk_class": 15,
     "crosswalk_class": 23,
     "vector": true,
-    "vector_process": "road",
+    "vector_process": "sidewalk",
     "predict_func": "get_predict_func_detectron",
     "cmap": "mapillary",
     "min_segment_pixels": 500,
-    "seg_filter_classes": [13, 15, 23],
-    "class_erode_px": {"15": 2},
-    "class_max_depth": {"15": 25.0},
-    "suppress_near_person_px": {"15": 25},
+    "seg_filter_classes": [
+        13,
+        15,
+        23
+    ],
+    "class_erode_px": {
+        "15": 2
+    },
+    "class_max_depth": {
+        "15": 8.0
+    },
+    "class_plane_filter": {
+        "15": {
+            "fit_max_depth": 3.0,
+            "tolerance": 0.1,
+            "min_fit_points": 10
+        }
+    },
+    "ground_plane_window": 30,
+    "ground_plane_inlier_thresh": 0.05,
+    "ground_plane_ransac_iter": 200,
+    "ground_plane_min_fit_points": 50,
+    "suppress_near_person_px": {},
     "person_class": 19,
     "sidewalk_pairwise_merge_min_overlap_ratio": 0.02,
-    "sidewalk_outline_alpha": 2.0,
-    "sidewalk_cluster_min_area": 3.0
+    "sidewalk_outline_alpha": 0.5,
+    "sidewalk_cluster_min_area": 3.0,
+    "seg_contour_max_depth": 30.0,
+    "seg_contour_idw_radius": 50.0,
+    "seg_contour_plane_fit_max_depth": 6.0,
+    "seg_contour_use_plane_depth": true,
+    "sidewalk_merge_overlap_buffer": 0.0,
+    "sidewalk_track_bridge_gap": 0.0,
+    "sidewalk_smooth_iterations": 0,
+    "sidewalk_simplify_tol": 0.0,
+    "sidewalk_post_simplify_tol": 0.0,
+    "sidewalk_min_seg_len": 0.0
 }

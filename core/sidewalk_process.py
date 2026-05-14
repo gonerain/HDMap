@@ -4,6 +4,7 @@ import warnings
 
 import cv2
 import numpy as np
+from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
 from shapely.geometry import MultiPolygon, Polygon
 
 from core.vector_common import FixedQueue
@@ -21,11 +22,110 @@ from core.geometry_utils import (
 )
 
 
+def _linefit_subset_simplify_closed(outline_xy, perp_tol=0.20):
+    """Anchor-constrained piecewise-linear simplification of a closed polygon.
+
+    Greedy Reumann-Witkam variant: walks the closed polygon starting at the
+    sharpest turn (most-likely-corner) vertex, and at each step extends the
+    chord forward as long as every interior vertex stays within `perp_tol`
+    of chord(V_i, V_j). Only chord endpoints are kept. Output is a strict
+    subset of the input (no synthetic vertices).
+
+    Use case: alpha-shape outlines have small LiDAR-noise jaggies along
+    actually-straight curb segments. This collapses those jaggies into a
+    single straight edge while preserving genuine corners and concavities
+    (those force a chord break naturally).
+
+    Args:
+        outline_xy: (N, 2) numpy array of CCW closed polygon vertices
+                    (last vertex may or may not duplicate first).
+        perp_tol:   maximum allowed perpendicular distance from any interior
+                    vertex to its enclosing chord (metres).
+
+    Returns:
+        (M, 2) float32 array of kept vertices, M <= N. The polygon is
+        returned open (no duplicated closing vertex).
+    """
+    pts = np.asarray(outline_xy, dtype=np.float64)
+    if len(pts) >= 2 and np.allclose(pts[0], pts[-1]):
+        pts = pts[:-1]
+    n = len(pts)
+    if n < 4:
+        return np.asarray(outline_xy, dtype=np.float32)
+
+    # Start at the vertex with the sharpest turn — guarantees that real
+    # corners are preserved (a sharp corner cannot be absorbed into a chord).
+    e_prev = pts - np.roll(pts, 1, axis=0)
+    e_next = np.roll(pts, -1, axis=0) - pts
+    norm_prev = np.linalg.norm(e_prev, axis=1)
+    norm_next = np.linalg.norm(e_next, axis=1)
+    denom = np.maximum(norm_prev * norm_next, 1e-12)
+    cos_turn = np.clip(np.einsum('ij,ij->i', e_prev, e_next) / denom, -1.0, 1.0)
+    turn = np.arccos(cos_turn)
+    start = int(np.argmax(turn))
+
+    keep = [start]
+    i = start
+    for _ in range(n + 1):
+        max_k = 1
+        for k in range(2, n + 1):
+            j_idx = (i + k) % n
+            chord_start = pts[i]
+            chord_end = pts[j_idx]
+            v = chord_end - chord_start
+            v_norm = float(np.hypot(v[0], v[1]))
+            if v_norm < 1e-9:
+                break
+            mid_offsets = (i + np.arange(1, k)) % n
+            mids = pts[mid_offsets]
+            cross = v[0] * (mids[:, 1] - chord_start[1]) - v[1] * (mids[:, 0] - chord_start[0])
+            d_max = float(np.abs(cross).max()) / v_norm
+            if d_max > perp_tol:
+                break
+            max_k = k
+            if j_idx == start:
+                break
+        next_i = (i + max_k) % n
+        if next_i == start:
+            break
+        keep.append(next_i)
+        i = next_i
+
+    if len(keep) < 3:
+        return np.asarray(outline_xy, dtype=np.float32)
+    return pts[keep].astype(np.float32, copy=False)
+
+
+def _interp_z_for_outline(xy_source, z_source, xy_query):
+    """Interpolate z for 2-D query points from a scattered (x,y)→z cloud.
+
+    Uses LinearNDInterpolator (Delaunay-based) so interior vertices get a
+    smooth planar estimate; vertices that fall outside the convex hull of the
+    source cloud (extrapolation) fall back to NearestNDInterpolator so no
+    NaN values escape.
+    """
+    pts = np.asarray(xy_source, dtype=np.float64)
+    zs  = np.asarray(z_source,  dtype=np.float64).ravel()
+    qry = np.asarray(xy_query,  dtype=np.float64)
+    if len(pts) < 3:
+        return NearestNDInterpolator(pts, zs)(qry)
+    z_vals = LinearNDInterpolator(pts, zs)(qry)
+    nan_mask = np.isnan(z_vals)
+    if nan_mask.any():
+        z_vals[nan_mask] = NearestNDInterpolator(pts, zs)(qry[nan_mask])
+    return z_vals.astype(np.float32)
+
+
 class SidewalkEdgeProcess(VectorProcess):
     name = "sidewalk"
     target_class_key = "sidewalk_class"
     default_target_class = 15
     requires_pose = False
+    # The sidewalk process never reads front/last windows (only current_points),
+    # so dirc_window's "look ahead N frames" requirement is wasted overhead and
+    # forces the bag's last 20 frames to be silently skipped. Override to 0 so
+    # the only warm-up is `window_size=10` and the tail tracks all the way out.
+    dirc_window = 0
     cluster_eps = 0.8
     cluster_min_samples = 12
     outline_alpha = 1.0
@@ -66,6 +166,7 @@ class SidewalkEdgeProcess(VectorProcess):
         super().__init__(args, config)
         self.step = max(int(config.get("sidewalk_step", config.get("vector_step", self.step))), 1)
         self.cluster_eps = float(config.get("sidewalk_cluster_eps", self.cluster_eps))
+        self.merge_overlap_buffer = float(config.get("sidewalk_merge_overlap_buffer", self.merge_overlap_buffer))
         self.cluster_min_samples = int(config.get("sidewalk_cluster_min_samples", self.cluster_min_samples))
         self.outline_alpha = float(config.get("sidewalk_outline_alpha", self.outline_alpha))
         self.max_candidates_per_frame = max(int(config.get("sidewalk_max_candidates_per_frame", 3)), 1)
@@ -303,14 +404,26 @@ class SidewalkEdgeProcess(VectorProcess):
 
     def make_record(self, logical_index, process_ctx, cluster_points, contour_xy, sidewalk_z):
         centroid = cluster_points[:, :2].mean(axis=0).astype(np.float32) if len(cluster_points) != 0 else np.zeros((2,), dtype=np.float32)
-        return {
+        outline_xy = as_xy(contour_xy)
+        if len(cluster_points) >= 3 and len(outline_xy) > 0:
+            outline_z = _interp_z_for_outline(
+                cluster_points[:, :2], cluster_points[:, 2], outline_xy
+            ).tolist()
+        else:
+            outline_z = [float(sidewalk_z)] * len(outline_xy)
+        rec = {
             "index": int(logical_index),
             "target_class": int(self.target_class),
             "window_centroid": process_ctx["current_center"].astype(np.float32).tolist(),
             "centroid": centroid.tolist(),
             "sidewalk_z": float(sidewalk_z),
-            "outline": as_xy(contour_xy).tolist(),
+            "outline": outline_xy.tolist(),
+            "outline_z": outline_z,
         }
+        # Underlying LiDAR points used for alpha-shape — kept as a numpy array
+        # for track-level accumulation. Stripped before JSON serialization.
+        rec["_cluster_points"] = np.asarray(cluster_points, dtype=np.float32)
+        return rec
 
     def _cluster_score(self, cluster_points, polygon, process_center_xy):
         area = float(polygon.area)
@@ -431,6 +544,12 @@ class SidewalkEdgeProcess(VectorProcess):
         if polygon is None and error_msg:
             warnings.warn(f"init_track: polygon_from_outline failed: {error_msg}")
         centroid = as_xy(record["centroid"])
+        outline_z = np.asarray(record.get("outline_z", [float(record["sidewalk_z"])] * len(outline_xy)), dtype=np.float32)
+        # Track-level LiDAR point accumulation: starts with this record's
+        # cluster_points; merged records concatenate their points onto this.
+        # update_track_metadata then re-runs alpha-shape on the union.
+        cp = record.get("_cluster_points")
+        input_points = np.asarray(cp, dtype=np.float32) if cp is not None else np.zeros((0, 3), dtype=np.float32)
         return {
             "id": int(track_id),
             "centroid": centroid[0].tolist() if len(centroid) == 1 else [0.0, 0.0],
@@ -441,7 +560,9 @@ class SidewalkEdgeProcess(VectorProcess):
             "outlines": [outline_xy.tolist()],
             "_polygon": polygon,
             "_outline_arrays": [outline_xy],
+            "_outline_z_arrays": [outline_z],
             "_z_values": [float(record["sidewalk_z"])],
+            "_input_points": input_points,
         }
 
     def merge_track_outline(self, base_polygon, new_polygon, outline_arrays):
@@ -465,8 +586,40 @@ class SidewalkEdgeProcess(VectorProcess):
         return merged_polygon, True
 
     def update_track_metadata(self, track):
+        # Per-track alpha-shape on accumulated LiDAR points: this is the whole
+        # point — every output vertex is now a real LiDAR measurement, gaps
+        # within a track that arose from per-window sparsity are bridged
+        # naturally because the points across all merged records are visible
+        # to a single alpha-shape pass.
+        input_pts = track.get("_input_points")
+        if input_pts is not None and len(input_pts) >= 4:
+            try:
+                contour_xy = self._extract_outline(np.asarray(input_pts, dtype=np.float32))
+                rebuilt, _ = polygon_from_outline(as_xy(contour_xy))
+                if rebuilt is not None and not rebuilt.is_empty and rebuilt.area > 0:
+                    track["_polygon"] = rebuilt
+            except Exception as e:
+                print(f"update_track_metadata: per-track alpha-shape failed: {e}")
+
         polygon = track["_polygon"]
         outline_xy = outline_from_polygon(polygon)
+
+        # Anchor-constrained line-fit simplification (V8): collapse straight
+        # runs of LiDAR-jaggy alpha-shape vertices into single edges while
+        # preserving real corners. All output vertices are a strict subset
+        # of the input (no synthetic points, unlike Chaikin smoothing).
+        linefit_enable = bool(self.config.get("sidewalk_linefit_enable", True))
+        if linefit_enable and len(outline_xy) >= 4:
+            perp_tol = float(self.config.get("sidewalk_linefit_perp_tol", 0.20))
+            simplified_xy = _linefit_subset_simplify_closed(
+                np.asarray(outline_xy, dtype=np.float64), perp_tol=perp_tol
+            )
+            if len(simplified_xy) >= 3:
+                new_poly, _ = polygon_from_outline(simplified_xy)
+                if new_poly is not None and not new_poly.is_empty and new_poly.area > 0:
+                    polygon = new_poly
+                    outline_xy = outline_from_polygon(polygon)
+
         if len(outline_xy) >= 4:
             simplify_tol = float(self.config.get("sidewalk_simplify_tol", self.fused_outline_simplify_tol))
             smooth_iterations = int(self.config.get("sidewalk_smooth_iterations", self.fused_outline_smooth_iterations))
@@ -519,17 +672,70 @@ class SidewalkEdgeProcess(VectorProcess):
                 polygon = hardened_polygon
                 outline_xy = outline_from_polygon(polygon)
 
+        # Snap each outline vertex to its nearest accumulated LiDAR sidewalk
+        # point so every reported vertex is a real measured point (and z is
+        # the LiDAR-measured z, not an interpolation). Vertices that survive
+        # alpha-shape are usually already LiDAR points; bridge/union may
+        # introduce a few synthetic ones — those get snapped here.
+        snap_to_lidar = bool(self.config.get("sidewalk_snap_to_lidar", True))
+
+        xy_parts, z_parts = [], []
+        for arr, zarr in zip(track["_outline_arrays"], track.get("_outline_z_arrays", [])):
+            xy = as_xy(arr)
+            zv = np.asarray(zarr, dtype=np.float32).ravel()
+            if len(xy) > 0 and len(zv) == len(xy):
+                xy_parts.append(xy)
+                z_parts.append(zv)
+
+        if snap_to_lidar and xy_parts and len(outline_xy) > 0:
+            from scipy.spatial import cKDTree
+            src_xy = np.vstack(xy_parts)
+            src_z  = np.concatenate(z_parts)
+            tree   = cKDTree(src_xy)
+            dist, idx = tree.query(outline_xy, k=1)
+            # Only snap vertices that are within `snap_radius` of a LiDAR point.
+            # Vertices farther than that (e.g. bridge interior points filling a
+            # gap with no LiDAR support) keep their original geometry-derived
+            # position to preserve polygon topology.
+            snap_radius = float(self.config.get("sidewalk_snap_radius", 0.4))
+            within = dist < snap_radius
+            snapped_xy = outline_xy.astype(np.float64).copy()
+            snapped_xy[within] = src_xy[idx[within]]
+            # z: snapped vertices use the LiDAR z, others interpolate
+            snapped_z = np.full(len(outline_xy), np.nan, dtype=np.float64)
+            snapped_z[within] = src_z[idx[within]]
+            if (~within).any():
+                snapped_z[~within] = _interp_z_for_outline(
+                    src_xy, src_z, outline_xy[~within]
+                )
+            # Drop consecutive duplicates after snap.
+            keep = [0]
+            for k in range(1, len(snapped_xy)):
+                if not np.allclose(snapped_xy[k], snapped_xy[keep[-1]], atol=1e-6):
+                    keep.append(k)
+            snapped_xy = snapped_xy[keep]
+            snapped_z  = snapped_z[keep]
+            new_poly, _ = polygon_from_outline(snapped_xy)
+            if new_poly is not None and not new_poly.is_empty and new_poly.area > 0:
+                polygon = new_poly
+                outline_xy = snapped_xy.astype(np.float32)
+                track["outline_z"] = snapped_z.astype(np.float32).tolist()
+            else:
+                track["outline_z"] = _interp_z_for_outline(src_xy, src_z, outline_xy).tolist()
+        elif xy_parts and len(outline_xy) > 0:
+            src_xy = np.vstack(xy_parts)
+            src_z  = np.concatenate(z_parts)
+            track["outline_z"] = _interp_z_for_outline(src_xy, src_z, outline_xy).tolist()
+        else:
+            fallback_z = float(np.mean(track["_z_values"])) if track["_z_values"] else 0.0
+            track["outline_z"] = [fallback_z] * len(outline_xy)
+
         track["_polygon"] = polygon
-        track["outline"] = outline_xy.tolist()
+        track["outline"] = outline_xy.tolist() if hasattr(outline_xy, 'tolist') else list(outline_xy)
         track["area"] = float(polygon.area) if polygon is not None else 0.0
 
-        points = []
-        for arr in track["_outline_arrays"]:
-            xy = as_xy(arr)
-            if len(xy) != 0:
-                points.append(xy)
-        if points:
-            merged_points = np.vstack(points)
+        if xy_parts:
+            merged_points = np.vstack(xy_parts)
             track["centroid"] = merged_points.mean(axis=0).astype(np.float32).tolist()
         else:
             track["centroid"] = [0.0, 0.0]
@@ -540,24 +746,23 @@ class SidewalkEdgeProcess(VectorProcess):
     def _merge_contained_or_overlapping_tracks(self, tracks):
         """Pairwise post-fusion sweep.
 
-        The per-record fusion loop is greedy and order-dependent: two
-        records that arrive far apart in time can each seed an independent
-        track that, after enough later merges, end up nested or
-        substantially overlapping. The user observed this as "sidewalks
-        inside another sidewalk" in the BEV.
+        Merges track pairs that:
+        - one contains the other,
+        - intersect by ≥ threshold of the smaller area, OR
+        - sit within `bridge_gap` metres of each other (so adjacent sidewalk
+          segments separated by a small unmapped gap — e.g. a corner the
+          vehicle didn't cover — get unified instead of being treated as two
+          tracks).
 
-        This pass iterates pairs to a fixed point and merges any pair where
-        - one polygon contains the other, OR
-        - intersection_area / min(area_i, area_j) >= threshold
-
-        Threshold defaults to 0.3 (i.e. they share at least 30% of the
-        smaller polygon's area). Tunable via
-        `sidewalk_pairwise_merge_min_overlap_ratio` in config.
+        Tunables:
+          sidewalk_pairwise_merge_min_overlap_ratio  (default 0.10)
+          sidewalk_track_bridge_gap                  (default 0.0; 0 = off)
         """
         if len(tracks) < 2:
             return tracks
 
-        threshold = float(self.config.get("sidewalk_pairwise_merge_min_overlap_ratio", 0.10))
+        threshold  = float(self.config.get("sidewalk_pairwise_merge_min_overlap_ratio", 0.10))
+        bridge_gap = float(self.config.get("sidewalk_track_bridge_gap", 0.0))
         changed = True
         while changed:
             changed = False
@@ -575,9 +780,11 @@ class SidewalkEdgeProcess(VectorProcess):
                         j += 1
                         continue
                     # Cheap bbox reject before the expensive shapely calls.
+                    # Inflate bbox by bridge_gap so almost-touching pairs still
+                    # reach the gap-based merge path below.
                     bx_j = p_j.bounds
-                    if (bx_i[2] < bx_j[0] or bx_j[2] < bx_i[0]
-                            or bx_i[3] < bx_j[1] or bx_j[3] < bx_i[1]):
+                    if (bx_i[2] + bridge_gap < bx_j[0] or bx_j[2] + bridge_gap < bx_i[0]
+                            or bx_i[3] + bridge_gap < bx_j[1] or bx_j[3] + bridge_gap < bx_i[1]):
                         j += 1
                         continue
                     try:
@@ -588,18 +795,49 @@ class SidewalkEdgeProcess(VectorProcess):
                         continue
                     min_area = float(min(p_i.area, p_j.area))
                     overlap_ratio = inter_area / min_area if min_area > 1e-6 else 0.0
-                    if not (contains or overlap_ratio >= threshold):
+                    near = (bridge_gap > 0.0 and p_i.distance(p_j) <= bridge_gap)
+                    if not (contains or overlap_ratio >= threshold or near):
                         j += 1
                         continue
 
-                    merged = p_i.union(p_j)
+                    if near and not (contains or overlap_ratio >= threshold):
+                        from shapely.ops import nearest_points
+                        from shapely.geometry import LineString, Point
+                        bw = float(self.config.get("sidewalk_track_bridge_width", 1.0))
+                        a, b = nearest_points(p_i, p_j)
+                        ax, ay = a.x, a.y; bx, by = b.x, b.y
+                        dx, dy = bx - ax, by - ay
+                        L = (dx*dx + dy*dy) ** 0.5
+                        if L > 1e-6:
+                            ex, ey = dx / L, dy / L
+                            ext = bw * 0.5 + 0.2
+                            a2 = Point(ax - ex * ext, ay - ey * ext)
+                            b2 = Point(bx + ex * ext, by + ey * ext)
+                            bridge = LineString([a2, b2]).buffer(bw * 0.5, cap_style=2)
+                            merged = p_i.union(p_j).union(bridge)
+                        else:
+                            merged = p_i.union(p_j)
+                    else:
+                        merged = p_i.union(p_j)
                     if isinstance(merged, MultiPolygon):
                         merged = max(merged.geoms, key=lambda geom: geom.area)
                     tracks[i]["_polygon"] = merged
                     tracks[i]["_outline_arrays"].extend(tracks[j].get("_outline_arrays", []))
+                    if tracks[j].get("_outline_z_arrays"):
+                        tracks[i].setdefault("_outline_z_arrays", []).extend(tracks[j]["_outline_z_arrays"])
                     tracks[i]["_z_values"].extend(tracks[j].get("_z_values", []))
                     tracks[i]["source_indices"].extend(tracks[j].get("source_indices", []))
                     tracks[i]["outlines"].extend(tracks[j].get("outlines", []))
+                    # Concatenate accumulated LiDAR points (the whole point of
+                    # this refactor — alpha-shape on combined points naturally
+                    # bridges the gap without synthetic vertices).
+                    pi_pts = tracks[i].get("_input_points", np.zeros((0, 3), dtype=np.float32))
+                    pj_pts = tracks[j].get("_input_points", np.zeros((0, 3), dtype=np.float32))
+                    if len(pi_pts) or len(pj_pts):
+                        tracks[i]["_input_points"] = np.vstack([
+                            np.asarray(pi_pts, dtype=np.float32),
+                            np.asarray(pj_pts, dtype=np.float32),
+                        ])
                     tracks.pop(j)
                     p_i = merged
                     changed = True
@@ -632,9 +870,18 @@ class SidewalkEdgeProcess(VectorProcess):
 
             matched_track["_polygon"] = merged_polygon
             matched_track["_outline_arrays"].append(outline_xy)
+            oz = np.asarray(record.get("outline_z", [float(record["sidewalk_z"])] * len(outline_xy)), dtype=np.float32)
+            matched_track["_outline_z_arrays"].append(oz)
             matched_track["_z_values"].append(float(record["sidewalk_z"]))
             matched_track["source_indices"].append(int(record["index"]))
             matched_track["outlines"].append(outline_xy.tolist())
+            cp = record.get("_cluster_points")
+            if cp is not None and len(cp) > 0:
+                prev = matched_track.get("_input_points", np.zeros((0, 3), dtype=np.float32))
+                matched_track["_input_points"] = np.vstack([
+                    np.asarray(prev, dtype=np.float32),
+                    np.asarray(cp, dtype=np.float32),
+                ])
             # Phase 1.3: smoothing/simplify chain runs once per track at the
             # end, not after every merge.
 
@@ -644,7 +891,7 @@ class SidewalkEdgeProcess(VectorProcess):
 
         for track in tracks:
             self.update_track_metadata(track)
-            for key in ("_polygon", "_outline_arrays", "_z_values"):
+            for key in ("_polygon", "_outline_arrays", "_outline_z_arrays", "_z_values", "_input_points"):
                 track.pop(key, None)
 
         for track in tracks:
@@ -653,7 +900,18 @@ class SidewalkEdgeProcess(VectorProcess):
         return tracks
 
     def finalize(self):
-        super().finalize()
+        # Strip non-serializable underscore-prefixed fields (notably
+        # `_cluster_points` numpy arrays) from records before the parent
+        # class writes them to JSON.
+        stripped = []
+        for r in self.records:
+            stripped.append({k: v for k, v in r.items() if not k.startswith("_")})
+        backup = self.records
+        self.records = stripped
+        try:
+            super().finalize()
+        finally:
+            self.records = backup
 
         fused = {
             "meta": {

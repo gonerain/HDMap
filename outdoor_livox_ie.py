@@ -16,7 +16,9 @@ import numpy as np
 import rospy
 from nav_msgs.msg import Path
 from rosbag import Bag
+from scipy.spatial.transform import Rotation as ScipyRotation
 from sensor_msgs.msg import Image
+from sensor_msgs.msg import Imu
 from sensor_msgs.msg import PointCloud2
 from tf.transformations import quaternion_from_matrix
 
@@ -265,137 +267,66 @@ def _r_enu_from_body_to_ie_angles(R):
     return float(roll), float(pitch), float(heading)
 
 
-class FlioProvider:
-    """IePoseProvider-compatible pose source backed by FAST-LIO2 mat_pre.txt.
+class ImuBuffer:
+    """Time-sorted IMU gyro samples with vectorized rotation integration.
 
-    Anchors the FAST-LIO2 odometry world frame to the absolute ENU frame using
-    a single IE reference pose at *anchor_time* (typically the first lidar frame
-    timestamp).  All subsequent poses come from FAST-LIO2 relative motion, so
-    frame-to-frame accuracy reflects LiDAR-IMU SLAM rather than float GNSS.
+    Built once by reading the bag's IMU topic; consulted per-LiDAR-packet to
+    compute per-point intra-scan rotation correction. Used by
+    `undistort_livox_points_imu()`.
+
+    Math: between consecutive 200Hz samples, vehicle yaw rate ≤ 30°/s so each
+    inter-sample rotvec step is ≤ 0.15°. Vector-sum of small rotvecs is exact
+    to ~1e-6 rad (Magnus / commutativity error negligible at small angles),
+    so cumulative rotvec acts like a "rotation integral" we can index with
+    linear interpolation.
     """
 
-    def __init__(self, mat_pre_path, first_lidar_time, anchor_ie_pose, ecef_origin, enu_from_ecef):
-        data = np.loadtxt(mat_pre_path)  # (N, 25)
-        t_rel = data[:, 0]
-        euler_deg = data[:, 1:4]   # roll, pitch, yaw  (body in FAST-LIO2 world)
-        pos_world = data[:, 4:7]   # position in FAST-LIO2 world frame (metres)
+    def __init__(self):
+        self._t = []
+        self._gyro = []
 
-        self.timestamps = first_lidar_time + t_rel
+    def add(self, timestamp_sec, gyro_xyz):
+        self._t.append(float(timestamp_sec))
+        self._gyro.append(np.asarray(gyro_xyz, dtype=np.float64))
 
-        # Derive roll/pitch from FLIO gravity vector (sensor is ~20° nose-down;
-        # using IE anchor roll/pitch gives ~4 m/s² error, gravity gives ~0.4 m/s²).
-        grav_mean = np.mean(data[:, 22:25], axis=0)  # gravity in FLIO world frame
-        pitch_sensor_rad = math.atan2(-grav_mean[0], math.sqrt(grav_mean[1]**2 + grav_mean[2]**2))
-        roll_sensor_rad = math.atan2(grav_mean[1], -grav_mean[2])
-        R_enu_from_world = rotation_matrix_from_ie(
-            math.degrees(roll_sensor_rad),
-            math.degrees(pitch_sensor_rad),
-            anchor_ie_pose.heading_deg,
-        )
-        t_enu_origin = pose_enu_from_ie(anchor_ie_pose, ecef_origin, enu_from_ecef)
+    def finalize(self):
+        self.t = np.asarray(self._t, dtype=np.float64)
+        gyro = np.vstack(self._gyro) if self._gyro else np.zeros((0, 3))
+        if len(self.t) >= 2:
+            dt = np.diff(self.t)
+            mean_g = 0.5 * (gyro[:-1] + gyro[1:])
+            step = mean_g * dt[:, None]
+            self._rotvec_cum = np.vstack([np.zeros(3), np.cumsum(step, axis=0)])
+        else:
+            self._rotvec_cum = np.zeros((len(self.t), 3))
+        self._gyro = None  # release
 
-        # ENU positions: rotate FAST-LIO2 world-frame positions into ENU then translate
-        pos_enu = (R_enu_from_world @ pos_world.T).T + t_enu_origin[None, :]
+    def _rotvec_at(self, t_targets):
+        """Linear-interp cumulative rotvec at each t_target (numpy array)."""
+        n = len(self.t)
+        if n < 2:
+            return np.zeros((len(t_targets), 3), dtype=np.float64)
+        idx_right = np.searchsorted(self.t, t_targets, side="left")
+        idx_right = np.clip(idx_right, 1, n - 1)
+        idx_left = idx_right - 1
+        t_l = self.t[idx_left]
+        t_r = self.t[idx_right]
+        alpha = np.clip((t_targets - t_l) / np.maximum(t_r - t_l, 1e-9), 0.0, 1.0)
+        return self._rotvec_cum[idx_left] + alpha[:, None] * (
+            self._rotvec_cum[idx_right] - self._rotvec_cum[idx_left])
 
-        # Convert ENU → ECEF → geodetic for each frame
-        # ecef = ecef_origin + enu_from_ecef.T @ t_enu   (row-vector: t_enu @ enu_from_ecef)
-        ecef_pts = ecef_origin[None, :] + pos_enu @ enu_from_ecef
-        lats, lons, heights = zip(*[_ecef_to_geodetic(e) for e in ecef_pts])
-        self._lat = np.array(lats, dtype=np.float64)
-        self._lon = np.array(lons, dtype=np.float64)
-        self._h = np.array(heights, dtype=np.float64)
+    def rotation_between(self, t_from, t_targets):
+        """Return (N, 3, 3) rotation matrices R(t_from → t_target).
 
-        # Rotation per frame: R_enu_from_body = R_enu_from_world @ R_world_from_body
-        rolls, pitches, headings = [], [], []
-        for e in euler_deg:
-            R_wfb = _euler_zyx_to_matrix(e[0], e[1], e[2])
-            R_efb = R_enu_from_world @ R_wfb
-            ro, pi, he = _r_enu_from_body_to_ie_angles(R_efb)
-            rolls.append(ro)
-            pitches.append(pi)
-            headings.append(he)
-        self._roll = np.array(rolls, dtype=np.float64)
-        self._pitch = np.array(pitches, dtype=np.float64)
-        self._heading = np.array(headings, dtype=np.float64)
-
-        self.poses = [
-            IePose(
-                timestamp=float(self.timestamps[i]),
-                latitude_deg=float(self._lat[i]),
-                longitude_deg=float(self._lon[i]),
-                height_m=float(self._h[i]),
-                roll_deg=float(self._roll[i]),
-                pitch_deg=float(self._pitch[i]),
-                heading_deg=float(self._heading[i]),
-            )
-            for i in range(len(self.timestamps))
-        ]
-        self._timestamps_list = self.timestamps.tolist()
-        print(
-            f"[FlioProvider] loaded {len(self.poses)} frames from {mat_pre_path}\n"
-            f"  anchor t={anchor_ie_pose.timestamp:.3f}  heading={anchor_ie_pose.heading_deg:.2f}°\n"
-            f"  gravity-derived roll={math.degrees(roll_sensor_rad):.2f}°  "
-            f"pitch={math.degrees(pitch_sensor_rad):.2f}°  (grav_flio={grav_mean})\n"
-            f"  anchor ENU origin: {t_enu_origin}"
-        )
-
-    # --- same interface as IePoseProvider ---
-
-    def get_interpolated(self, timestamp):
-        if not self.poses:
-            return None
-        ts_list = self._timestamps_list
-        right = bisect.bisect_right(ts_list, float(timestamp))
-        left = max(0, min(len(self.poses) - 1, right - 1))
-        lp = self.poses[left]
-        if left + 1 >= len(self.poses):
-            return lp
-        rp = self.poses[left + 1]
-        dt = float(rp.timestamp - lp.timestamp)
-        if dt <= 1e-9:
-            return lp
-        alpha = float(np.clip((timestamp - lp.timestamp) / dt, 0.0, 1.0))
-        return IePose(
-            timestamp=float(timestamp),
-            latitude_deg=float(lp.latitude_deg + (rp.latitude_deg - lp.latitude_deg) * alpha),
-            longitude_deg=float(lp.longitude_deg + (rp.longitude_deg - lp.longitude_deg) * alpha),
-            height_m=float(lp.height_m + (rp.height_m - lp.height_m) * alpha),
-            roll_deg=lerp_angle_deg(lp.roll_deg, rp.roll_deg, alpha),
-            pitch_deg=lerp_angle_deg(lp.pitch_deg, rp.pitch_deg, alpha),
-            heading_deg=lerp_angle_deg(lp.heading_deg, rp.heading_deg, alpha),
-        )
-
-    def get_interpolated_batch(self, timestamps):
-        n = len(self.poses)
-        if n == 0:
-            return None
-        ts_arr = np.asarray(timestamps, dtype=np.float64)
-        ts_self = self.timestamps
-        right = np.searchsorted(ts_self, ts_arr, side="right")
-        left = np.clip(right - 1, 0, n - 1)
-        right = np.clip(right, 0, n - 1)
-        t_left = ts_self[left]
-        t_right = ts_self[right]
-        dt = t_right - t_left
-        alpha = np.where(dt > 1e-9, (ts_arr - t_left) / dt, 0.0)
-        alpha = np.clip(alpha, 0.0, 1.0)
-
-        def _lerp(a, b):
-            return a + alpha * (b - a)
-
-        def _lerp_ang(a, b):
-            d = (b - a + 180.0) % 360.0 - 180.0
-            return a + d * alpha
-
-        return {
-            "timestamp": ts_arr,
-            "latitude_deg": _lerp(self._lat[left], self._lat[right]),
-            "longitude_deg": _lerp(self._lon[left], self._lon[right]),
-            "height_m": _lerp(self._h[left], self._h[right]),
-            "roll_deg": _lerp_ang(self._roll[left], self._roll[right]),
-            "pitch_deg": _lerp_ang(self._pitch[left], self._pitch[right]),
-            "heading_deg": _lerp_ang(self._heading[left], self._heading[right]),
-        }
+        R = exp(rotvec_cum(t_target) - rotvec_cum(t_from)) under small-angle
+        commutativity (valid at 200 Hz IMU rates).
+        """
+        if not hasattr(self, "t") or len(self.t) < 2:
+            return np.tile(np.eye(3), (len(t_targets), 1, 1))
+        rv_from = self._rotvec_at(np.array([float(t_from)]))[0]
+        rv_to = self._rotvec_at(np.asarray(t_targets, dtype=np.float64))
+        rv_delta = rv_to - rv_from
+        return ScipyRotation.from_rotvec(rv_delta).as_matrix()
 
 
 def deg2rad(v):
@@ -556,6 +487,77 @@ def ie_body_to_lidar(points_body_flu):
     return (R_LIDAR_FROM_BASE @ (pts - T_FLU_LIDAR_FROM_SPAN[None, :]).T).T
 
 
+class RollingGroundPlane:
+    """Sliding-window buffer of near-ground LiDAR points across recent frames.
+
+    Each frame's near-ground points (camera_Z <= fit_max_depth, ground-class)
+    are accumulated together with the per-frame (R_enu_from_lidar, t_enu_lidar)
+    so the buffer can transform them into any later frame's LiDAR coordinates
+    for a unified RANSAC plane fit. Per-frame fits on ~30-100 sidewalk points
+    are too noisy and break on frames with no near coverage; pooling ~3000
+    points across 30 frames gives a robust, stable plane.
+    """
+
+    def __init__(self, window=30, ransac_iter=200, inlier_thresh=0.05,
+                 min_fit_points=50, rng_seed=0):
+        from collections import deque as _deque
+        self.window = int(window)
+        self.ransac_iter = int(ransac_iter)
+        self.inlier_thresh = float(inlier_thresh)
+        self.min_fit_points = int(min_fit_points)
+        self.history = _deque()
+        self._rng = np.random.default_rng(rng_seed)
+
+    def add(self, R_enu_from_lidar, t_enu_lidar, near_pts_lidar):
+        if near_pts_lidar is None or len(near_pts_lidar) == 0:
+            return
+        self.history.append((
+            np.asarray(R_enu_from_lidar, dtype=np.float64).copy(),
+            np.asarray(t_enu_lidar, dtype=np.float64).copy(),
+            np.asarray(near_pts_lidar, dtype=np.float64).copy(),
+        ))
+        while len(self.history) > self.window:
+            self.history.popleft()
+
+    def fit_in_target_lidar(self, R_enu_from_lidar_tgt, t_enu_lidar_tgt):
+        if not self.history:
+            return None
+        R_l_from_enu = np.asarray(R_enu_from_lidar_tgt, dtype=np.float64).T
+        t_tgt = np.asarray(t_enu_lidar_tgt, dtype=np.float64)
+        chunks = []
+        for R_old, t_old, pts_old in self.history:
+            enu = (R_old @ pts_old.T).T + t_old
+            pts_tgt = (R_l_from_enu @ (enu - t_tgt).T).T
+            chunks.append(pts_tgt)
+        pts = np.vstack(chunks)
+        n = len(pts)
+        if n < self.min_fit_points:
+            return None
+        best_inlier_count = 0
+        best_inliers = None
+        for _ in range(self.ransac_iter):
+            idx = self._rng.choice(n, size=3, replace=False)
+            sample = pts[idx]
+            A_s = np.column_stack([sample[:, 0], sample[:, 1], np.ones(3)])
+            try:
+                coef = np.linalg.solve(A_s, sample[:, 2])
+            except np.linalg.LinAlgError:
+                continue
+            a, b, c = coef
+            pred = a * pts[:, 0] + b * pts[:, 1] + c
+            inliers = np.abs(pts[:, 2] - pred) < self.inlier_thresh
+            cnt = int(inliers.sum())
+            if cnt > best_inlier_count:
+                best_inlier_count = cnt
+                best_inliers = inliers
+        if best_inliers is None or best_inlier_count < self.min_fit_points // 2:
+            return None
+        in_pts = pts[best_inliers]
+        A = np.column_stack([in_pts[:, 0], in_pts[:, 1], np.ones(len(in_pts))])
+        coef, *_ = np.linalg.lstsq(A, in_pts[:, 2], rcond=None)
+        return float(coef[0]), float(coef[1]), float(coef[2])
+
+
 def livox_msg_to_points_with_meta(msg):
     if getattr(msg, "_type", "") != "livox_ros_driver2/CustomMsg":
         raise RuntimeError(f"Unsupported lidar msg type: {getattr(msg, '_type', '')}, expected livox_ros_driver2/CustomMsg")
@@ -656,6 +658,8 @@ def project_lidar_to_class(
     camera_model="pinhole",
     min_depth=0.2,
     class_max_depth=None,
+    class_plane_filter=None,
+    class_plane_coefs=None,
     zbuffer_px=0,
 ):
     """Project LiDAR points (in lidar frame) onto a class-id image and return
@@ -673,6 +677,14 @@ def project_lidar_to_class(
     grows fast (a 2 mrad calibration residual is ~5 cm at 25 m), so we kill
     the long-tail false positives at distance for the classes that suffer
     most from boundary jitter.
+
+    `class_plane_filter` is an optional
+    `{class_id: {"fit_max_depth": float, "tolerance": float}}` map. For each
+    class, fit z = a*x + b*y + c (LiDAR frame) on points with
+    `camera_Z <= fit_max_depth` and drop the remaining (far) points whose
+    LiDAR z deviates from the fitted plane by more than `tolerance` metres.
+    Runs after `class_max_depth` so the plane filter only cleans the
+    surviving 3m < camera_Z <= class_max_depth window.
 
     `zbuffer_px` keeps only the nearest LiDAR point per projected pixel block
     before class lookup. Without this visibility check, a farther point can be
@@ -746,6 +758,42 @@ def project_lidar_to_class(
             if far_mask.any():
                 classes[far_mask] = float(SEG_BACKGROUND_CLASS)
 
+    if class_plane_filter:
+        kept_lidar = points[keep_global]
+        kept_camera_z = points_camera[keep_global, 2]
+        for cls_id, params in class_plane_filter.items():
+            cls_val = float(cls_id)
+            fit_depth = float(params.get("fit_max_depth", 3.0))
+            tol = float(params.get("tolerance", 0.15))
+            min_pts = int(params.get("min_fit_points", 10))
+            cls_mask = (classes == cls_val)
+            far_mask = cls_mask & (kept_camera_z > fit_depth)
+            if not far_mask.any():
+                continue
+            pre_coef = (class_plane_coefs or {}).get(cls_id)
+            if pre_coef is None:
+                near_mask = cls_mask & (kept_camera_z <= fit_depth)
+                if int(near_mask.sum()) < min_pts:
+                    classes[far_mask] = float(SEG_BACKGROUND_CLASS)
+                    continue
+                near_pts = kept_lidar[near_mask]
+                A = np.column_stack([near_pts[:, 0], near_pts[:, 1],
+                                     np.ones(len(near_pts), dtype=np.float64)])
+                try:
+                    coef, *_ = np.linalg.lstsq(A, near_pts[:, 2], rcond=None)
+                except np.linalg.LinAlgError:
+                    classes[far_mask] = float(SEG_BACKGROUND_CLASS)
+                    continue
+                a, b, c = float(coef[0]), float(coef[1]), float(coef[2])
+            else:
+                a, b, c = float(pre_coef[0]), float(pre_coef[1]), float(pre_coef[2])
+            far_pts = kept_lidar[far_mask]
+            pred_z = a * far_pts[:, 0] + b * far_pts[:, 1] + c
+            bad = np.abs(far_pts[:, 2] - pred_z) > tol
+            if bad.any():
+                far_idx = np.where(far_mask)[0]
+                classes[far_idx[bad]] = float(SEG_BACKGROUND_CLASS)
+
     out = np.empty((len(keep_global), 4), dtype=np.float64)
     out[:, :3] = points[keep_global]
     out[:, 3] = classes
@@ -801,6 +849,8 @@ def get_semantic_pcd(
     seg_filter_classes=None,
     class_erode_px=None,
     class_max_depth=None,
+    class_plane_filter=None,
+    class_plane_coefs=None,
     zbuffer_px=0,
     suppress_near_person_px=None,
     person_class=19,
@@ -879,6 +929,8 @@ def get_semantic_pcd(
         translation_lidar_from_camera,
         camera_model=camera_model,
         class_max_depth=class_max_depth,
+        class_plane_filter=class_plane_filter,
+        class_plane_coefs=class_plane_coefs,
         zbuffer_px=zbuffer_px,
     )
     if len(sem_pcdata) == 0:
@@ -952,6 +1004,33 @@ def undistort_livox_points_to_base(points_xyzi, offsets_s, base_pose, ie_provide
     return out
 
 
+def undistort_livox_points_imu(points_xyzi, offsets_s, base_ts, imu_buffer):
+    """Motion-compensate a Livox packet using raw IMU gyro integration.
+
+    For each point at absolute time `base_ts + offset_s`, the body has rotated
+    by R(t_base → t_off) since the packet's base timestamp. The point is
+    measured in the body frame *at* t_off; we want it in the body frame at
+    t_base. So:
+        p_at_base = R(t_off → t_base) @ p_at_off
+                  = R(t_base → t_off)^{-1} @ p_at_off
+    Translation is ignored in v1 (worst-case 25 cm per-point at 5 m/s × 50 ms,
+    comparable to LiDAR range noise).
+
+    Assumes IMU and LiDAR share the same rotation frame — true for the Livox
+    internal `/imu` (extrinsic R = identity in `livox_ie.yaml`).
+    """
+    if imu_buffer is None or not hasattr(imu_buffer, "t") or len(imu_buffer.t) < 2:
+        return points_xyzi
+    if len(points_xyzi) == 0:
+        return points_xyzi
+    out = np.array(points_xyzi, dtype=np.float64, copy=True)
+    t_targets = float(base_ts) + np.asarray(offsets_s, dtype=np.float64)
+    R_off_from_base = imu_buffer.rotation_between(float(base_ts), t_targets)  # (N, 3, 3)
+    # einsum with R[..., j, i] picks the j-th row of the transpose → applies R^T.
+    out[:, :3] = np.einsum("nji,nj->ni", R_off_from_base, out[:, :3])
+    return out
+
+
 def find_bracketing_lidar(lidar_queue, t_img):
     if len(lidar_queue) < 2:
         return None
@@ -1014,9 +1093,6 @@ def main():
     parser.add_argument("-c", "--config", default="config/outdoor_config_livox_ie.json")
     parser.add_argument("-b", "--bag", default=None)
     parser.add_argument("--ie-txt", default=None, help="Path to IE txt such as 0421-AM-2026.txt")
-    parser.add_argument("--flio-mat-pre", default=None, help="Path to FAST-LIO2 mat_pre.txt (replaces IE for motion)")
-    parser.add_argument("--flio-first-lidar-time", default=None, type=float,
-                        help="Absolute Unix time of the first lidar frame (default: 1776743232.100252 for 0421-AM)")
     parser.add_argument("--camera-topic", default=None)
     parser.add_argument("--lidar-topic", default=None)
     parser.add_argument("-f", "--fastfoward", default=None, type=float)
@@ -1065,6 +1141,21 @@ def main():
     class_erode_px = {int(k): int(v) for k, v in class_erode_px.items()}
     class_max_depth = dict(config.get("class_max_depth", {sidewalk_class: 25.0}))
     class_max_depth = {int(k): float(v) for k, v in class_max_depth.items()}
+    class_plane_filter = dict(config.get("class_plane_filter", {}))
+    class_plane_filter = {int(k): dict(v) for k, v in class_plane_filter.items()}
+    plane_window = int(config.get("ground_plane_window", 30))
+    plane_inlier_thresh = float(config.get("ground_plane_inlier_thresh", 0.05))
+    plane_ransac_iter = int(config.get("ground_plane_ransac_iter", 200))
+    plane_min_fit_points = int(config.get("ground_plane_min_fit_points", 50))
+    rolling_planes = {
+        cls_id: RollingGroundPlane(
+            window=plane_window,
+            ransac_iter=plane_ransac_iter,
+            inlier_thresh=plane_inlier_thresh,
+            min_fit_points=plane_min_fit_points,
+        )
+        for cls_id in class_plane_filter
+    }
     suppress_near_person_px = dict(config.get(
         "suppress_near_person_px", {sidewalk_class: 25}))
     suppress_near_person_px = {int(k): int(v) for k, v in suppress_near_person_px.items()}
@@ -1114,19 +1205,41 @@ def main():
     ecef_origin = geodetic_to_ecef(poses[0].latitude_deg, poses[0].longitude_deg, poses[0].height_m)
     enu_from_ecef = ecef_to_enu_matrix(poses[0].latitude_deg, poses[0].longitude_deg)
 
-    flio_mat_pre = args.flio_mat_pre if args.flio_mat_pre is not None else config.get("flio_mat_pre", None)
-    if flio_mat_pre:
-        first_lidar_time = (
-            args.flio_first_lidar_time
-            if args.flio_first_lidar_time is not None
-            else float(config.get("flio_first_lidar_time", 1776743232.100252))
-        )
-        # Use the IE pose at first_lidar_time as the anchor for absolute position
-        ie_tmp = IePoseProvider(poses)
-        anchor_pose = ie_tmp.get_interpolated(first_lidar_time)
-        ie_provider = FlioProvider(flio_mat_pre, first_lidar_time, anchor_pose, ecef_origin, enu_from_ecef)
-    else:
-        ie_provider = IePoseProvider(poses)
+    # Single pose source: IE.txt for global ENU anchor. Per-point sub-frame
+    # motion compensation comes from raw IMU (see ImuBuffer below), not from
+    # the pose provider — pose interpolation at frame rate inherits noise
+    # that corrupts intra-scan distortion correction.
+    ie_provider = IePoseProvider(poses)
+    print(f"[pose] IE-only (n={len(poses)} samples)")
+
+    # Build IMU buffer for sub-frame de-distortion via first-pass bag read.
+    # 200 Hz Livox internal IMU, hardware-synced with the LiDAR scanner.
+    dedistort_method = str(config.get("dedistort_method", "imu")).lower()
+    imu_buffer = None
+    if dedistort_method == "imu":
+        imu_topic = config.get("imu_topic", "/imu")
+        imu_buffer = ImuBuffer()
+        n_imu = 0
+        with Bag(bag_path) as bag_imu:
+            bag_start = bag_imu.get_start_time() + float(start_offset)
+            bag_start_t = genpy.Time(bag_start)
+            bag_end_t = None
+            if duration is not None and float(duration) > 0:
+                bag_end_t = genpy.Time(bag_start + float(duration))
+            for _topic, msg, stamp in bag_imu.read_messages(
+                topics=[imu_topic], start_time=bag_start_t, end_time=bag_end_t):
+                t = message_stamp_sec(msg, stamp)
+                gv = msg.angular_velocity
+                imu_buffer.add(t, [gv.x, gv.y, gv.z])
+                n_imu += 1
+        imu_buffer.finalize()
+        if n_imu < 2:
+            print(f"[imu] WARNING: only {n_imu} samples from {imu_topic}; "
+                  f"de-distortion will be a no-op")
+            imu_buffer = None
+        else:
+            print(f"[imu] loaded {n_imu} samples from {imu_topic}, "
+                  f"t∈[{imu_buffer.t[0]:.3f}, {imu_buffer.t[-1]:.3f}]")
 
     rospy.init_node("fix_distortion", anonymous=False, log_level=rospy.DEBUG, disable_signals=True)
     fixCloudPubHandle = rospy.Publisher("dedistortion_cloud", PointCloud2, queue_size=5)
@@ -1138,7 +1251,13 @@ def main():
     _ = groundTruthPubHandle
     print("ros ready")
 
-    predictor = getattr(predict, config["predict_func"])(config["model_config"], config["model_file"])
+    predictor_kwargs = {}
+    class_margin_min = config.get("class_margin_min")
+    if class_margin_min:
+        predictor_kwargs["class_margin_min"] = {int(k): float(v) for k, v in class_margin_min.items()}
+    predictor = getattr(predict, config["predict_func"])(
+        config["model_config"], config["model_file"], **predictor_kwargs,
+    )
     print("torch ready")
 
     bag = None
@@ -1187,16 +1306,11 @@ def main():
                     continue
                 packet = reduce_lidar_packet(packet, stride=lidar_stride, max_points=max_lidar_points)
                 base_ts = float(packet["base_timestamp"])
-                lidar_pose = ie_provider.get_interpolated(base_ts)
-                if lidar_pose is None:
-                    continue
-                undistorted_xyzi = undistort_livox_points_to_base(
+                undistorted_xyzi = undistort_livox_points_imu(
                     packet["points_xyzi"],
                     packet["offsets_s"],
-                    lidar_pose,
-                    ie_provider,
-                    ecef_origin,
-                    enu_from_ecef,
+                    base_ts,
+                    imu_buffer,
                 )
                 lidar_queue.append({"timestamp": base_ts, "points_xyzi": undistorted_xyzi})
             elif topic == camera_topic:
@@ -1249,6 +1363,17 @@ def main():
                 t_enu = pose_enu_from_ie(image_pose, ecef_origin, enu_from_ecef)
                 pose_save.append(np.array([t_enu[0], t_enu[1], t_enu[2], q[0], q[1], q[2], q[3]], dtype=np.float64))
 
+                R_enu_from_body_cur = rotation_matrix_from_ie(
+                    image_pose.roll_deg, image_pose.pitch_deg, image_pose.heading_deg)
+                R_enu_from_lidar_cur = R_enu_from_body_cur @ R_BASE_FROM_LIDAR
+                t_enu_lidar_cur = R_enu_from_body_cur @ T_FLU_LIDAR_FROM_SPAN + t_enu
+
+                class_plane_coefs_cur = {}
+                for cls_id, est in rolling_planes.items():
+                    coefs = est.fit_in_target_lidar(R_enu_from_lidar_cur, t_enu_lidar_cur)
+                    if coefs is not None:
+                        class_plane_coefs_cur[cls_id] = coefs
+
                 imgPubHandle.publish(bri.cv2_to_imgmsg(img))
                 cv2.imwrite(config["save_folder"] + "/originpics/%06d.png" % index, img)
 
@@ -1266,6 +1391,8 @@ def main():
                     seg_filter_classes=seg_filter_classes,
                     class_erode_px=class_erode_px,
                     class_max_depth=class_max_depth,
+                    class_plane_filter=class_plane_filter,
+                    class_plane_coefs=class_plane_coefs_cur,
                     zbuffer_px=projection_zbuffer_px,
                     suppress_near_person_px=suppress_near_person_px,
                     person_class=person_class,
@@ -1273,6 +1400,16 @@ def main():
                 cv2.imwrite(config["save_folder"] + "/sempics/%06d.png" % index, semimg)
                 semimg_vis = colors[semimg.flatten()].reshape((*semimg.shape, 3))
                 semimgPubHandle.publish(bri.cv2_to_imgmsg(semimg_vis, "bgr8"))
+
+                if rolling_planes and len(sem_pcd_lidar) > 0:
+                    pts_lidar_xyz = sem_pcd_lidar[:, :3]
+                    cam_z = (rotation_lidar_from_camera.T @ (pts_lidar_xyz - translation_lidar_from_camera).T)[2]
+                    for cls_id, est in rolling_planes.items():
+                        params = class_plane_filter.get(cls_id, {})
+                        fit_depth = float(params.get("fit_max_depth", 3.0))
+                        near_mask = (sem_pcd_lidar[:, 3] == float(cls_id)) & (cam_z <= fit_depth) & (cam_z > 0.0)
+                        if near_mask.any():
+                            est.add(R_enu_from_lidar_cur, t_enu_lidar_cur, pts_lidar_xyz[near_mask])
 
                 sem_world_pcd = transform_semantic_lidar_to_world(sem_pcd_lidar, image_pose, ecef_origin, enu_from_ecef)
                 pickle.dump(sem_world_pcd, store_file)
