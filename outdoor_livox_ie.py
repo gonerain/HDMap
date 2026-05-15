@@ -1205,7 +1205,8 @@ def main():
     # the pose provider — pose interpolation at frame rate inherits noise
     # that corrupts intra-scan distortion correction.
     ie_provider = IePoseProvider(poses)
-    print(f"[pose] IE-only (n={len(poses)} samples)")
+    print(f"[pose] global anchor = IE ({len(poses)} samples); "
+          f"sub-frame de-distortion = raw IMU (see [imu] line below)")
 
     # Build IMU buffer for sub-frame de-distortion via first-pass bag read.
     # 200 Hz Livox internal IMU, hardware-synced with the LiDAR scanner.
