@@ -1,6 +1,6 @@
 {
-    "bag_file": "data/0421-AM/segment_2026-04-21-11-47-12_1.bag",
-    "ie_txt": "data/0421-AM/0421-AM-2026.txt",
+    "bag_folder": "data/0421-PM",
+    "ie_txt": "data/0421-PM/0421-PM-2026.txt",
     "start_time": 0,
     "play_time": -1,
     "LiDAR_topic": "/lidar",

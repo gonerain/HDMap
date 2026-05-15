@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 import argparse
 import bisect
+import glob
 import json
 import math
 import os
@@ -86,6 +87,23 @@ def cmkdir(path):
             os.mkdir(cur[1:])
         except Exception:
             pass
+
+
+def resolve_bag_paths(bag_arg):
+    """Return ordered list of bag files. Accepts a single .bag path OR a
+    folder containing segment_<ts>_N.bag files (sorted by the trailing N)."""
+    if os.path.isdir(bag_arg):
+        bags = glob.glob(os.path.join(bag_arg, "*.bag"))
+        if not bags:
+            raise SystemExit(f"no *.bag files found in {bag_arg}")
+
+        def _key(p):
+            m = re.search(r"_(\d+)\.bag$", os.path.basename(p))
+            return (0, int(m.group(1))) if m else (1, os.path.basename(p))
+        return sorted(bags, key=_key)
+    if not os.path.isfile(bag_arg):
+        raise SystemExit(f"bag not found: {bag_arg}")
+    return [bag_arg]
 
 
 def dms_to_deg(deg_token: str, minute_token: str, second_token: str) -> float:
@@ -1075,7 +1093,18 @@ def main():
     with open(args.config, "r", encoding="utf-8") as f:
         config = json.load(f)
 
-    bag_path = args.bag if args.bag is not None else config["bag_file"]
+    bag_arg = (args.bag if args.bag is not None
+               else config.get("bag_folder") or config.get("bag_file"))
+    if bag_arg is None:
+        raise SystemExit("config must set either 'bag_file' or 'bag_folder', "
+                         "or pass -b/--bag")
+    bag_paths = resolve_bag_paths(bag_arg)
+    if len(bag_paths) == 1:
+        print(f"bag: {bag_paths[0]}")
+    else:
+        print(f"bag_folder: {bag_arg}  ({len(bag_paths)} segments, "
+              f"first={os.path.basename(bag_paths[0])}, "
+              f"last={os.path.basename(bag_paths[-1])})")
     ie_txt = args.ie_txt if args.ie_txt is not None else config.get("ie_txt", "data/outdoor/0421-AM-2026.txt")
     camera_topic = args.camera_topic if args.camera_topic is not None else config.get("camera_topic", "/front_camera/image/compressed")
     lidar_topic = args.lidar_topic if args.lidar_topic is not None else config.get("LiDAR_topic", "/lidar")
@@ -1186,18 +1215,26 @@ def main():
         imu_topic = config.get("imu_topic", "/imu")
         imu_buffer = ImuBuffer()
         n_imu = 0
-        with Bag(bag_path) as bag_imu:
-            bag_start = bag_imu.get_start_time() + float(start_offset)
-            bag_start_t = genpy.Time(bag_start)
-            bag_end_t = None
-            if duration is not None and float(duration) > 0:
-                bag_end_t = genpy.Time(bag_start + float(duration))
-            for _topic, msg, stamp in bag_imu.read_messages(
-                topics=[imu_topic], start_time=bag_start_t, end_time=bag_end_t):
-                t = message_stamp_sec(msg, stamp)
-                gv = msg.angular_velocity
-                imu_buffer.add(t, [gv.x, gv.y, gv.z])
-                n_imu += 1
+        for bi, bp in enumerate(bag_paths):
+            with Bag(bp) as bag_imu:
+                # start_time / play_time only apply to the FIRST segment;
+                # subsequent segments are read in full so the IMU stream
+                # remains contiguous across bag boundaries.
+                if bi == 0:
+                    bag_start = bag_imu.get_start_time() + float(start_offset)
+                    bag_start_t = genpy.Time(bag_start)
+                    bag_end_t = None
+                    if duration is not None and float(duration) > 0:
+                        bag_end_t = genpy.Time(bag_start + float(duration))
+                else:
+                    bag_start_t = None
+                    bag_end_t = None
+                for _topic, msg, stamp in bag_imu.read_messages(
+                    topics=[imu_topic], start_time=bag_start_t, end_time=bag_end_t):
+                    t = message_stamp_sec(msg, stamp)
+                    gv = msg.angular_velocity
+                    imu_buffer.add(t, [gv.x, gv.y, gv.z])
+                    n_imu += 1
         imu_buffer.finalize()
         if n_imu < 2:
             print(f"[imu] WARNING: only {n_imu} samples from {imu_topic}; "
@@ -1314,13 +1351,7 @@ def main():
     timing = _Timing(bool(args.time_it))
 
     try:
-        bag = Bag(bag_path)
-        start = bag.get_start_time() + float(start_offset)
-        start_t = genpy.Time.from_sec(start)
-        end_t = None if float(duration) == -1 else genpy.Time.from_sec(start + float(duration))
-        bagread = bag.read_messages(topics=[lidar_topic, camera_topic], start_time=start_t, end_time=end_t)
-        print("bag ready")
-
+        cmkdir(config["save_folder"])
         if not args.offline:
             cmkdir(config["save_folder"] + "/originpics")
             cmkdir(config["save_folder"] + "/sempics")
@@ -1332,163 +1363,186 @@ def main():
         road_chunks_file = open(road_chunks_path, "wb")
 
         timing.tick()
-        for topic, msg, stamp in bagread:
-            timing.tock("bag_read")
+        for bag_idx, bp in enumerate(bag_paths):
             if STOP_REQUESTED or STOP_AFTER_MAX_FRAMES or rospy.is_shutdown():
                 break
-            msg_total += 1
-            ts = float(stamp.to_sec())
-            if topic == lidar_topic:
-                msg_lidar += 1
-                try:
-                    packet = livox_msg_to_points_with_meta(msg)
-                except Exception as e:
-                    print(f"skip lidar frame at {ts:.3f}: {e}")
-                    continue
-                packet = reduce_lidar_packet(packet, stride=lidar_stride, max_points=max_lidar_points)
-                base_ts = float(packet["base_timestamp"])
-                undistorted_xyzi = undistort_livox_points_imu(
-                    packet["points_xyzi"],
-                    packet["offsets_s"],
-                    base_ts,
-                    imu_buffer,
-                )
-                lidar_queue.append({"timestamp": base_ts, "points_xyzi": undistorted_xyzi})
-                timing.tock("lidar_pre")
-            elif topic == camera_topic:
-                msg_camera += 1
-                image_queue.append((message_stamp_sec(msg, stamp), msg))
-                timing.tock("lidar_pre")
+            bag = Bag(bp)
+            # start_time / play_time only narrow the FIRST segment; later
+            # segments are read in full so cross-bag lidar/image queues stay
+            # in time order.
+            if bag_idx == 0:
+                start = bag.get_start_time() + float(start_offset)
+                start_t = genpy.Time.from_sec(start)
+                end_t = None if float(duration) == -1 else genpy.Time.from_sec(start + float(duration))
             else:
-                continue
+                start_t = None
+                end_t = None
+            bagread = bag.read_messages(topics=[lidar_topic, camera_topic], start_time=start_t, end_time=end_t)
+            print(f"bag {bag_idx + 1}/{len(bag_paths)} ready: {os.path.basename(bp)}")
 
-            while image_queue:
+            for topic, msg, stamp in bagread:
+                timing.tock("bag_read")
                 if STOP_REQUESTED or STOP_AFTER_MAX_FRAMES or rospy.is_shutdown():
                     break
-                img_ts, img_msg = image_queue[0]
-                nearest = choose_nearest_lidar(lidar_queue, img_ts, max_sync_dt)
-                if nearest is None:
-                    break
-                if args.max_frames is not None and index >= int(args.max_frames):
-                    request_max_frames_stop(args.max_frames)
-                    image_queue.clear()
-                    break
-                try:
-                    img = decode_image_msg(img_msg)
-                except Exception as e:
-                    print(f"skip image frame at {img_ts:.3f}: {e}")
-                    image_queue.popleft()
+                msg_total += 1
+                ts = float(stamp.to_sec())
+                if topic == lidar_topic:
+                    msg_lidar += 1
+                    try:
+                        packet = livox_msg_to_points_with_meta(msg)
+                    except Exception as e:
+                        print(f"skip lidar frame at {ts:.3f}: {e}")
+                        continue
+                    packet = reduce_lidar_packet(packet, stride=lidar_stride, max_points=max_lidar_points)
+                    base_ts = float(packet["base_timestamp"])
+                    undistorted_xyzi = undistort_livox_points_imu(
+                        packet["points_xyzi"],
+                        packet["offsets_s"],
+                        base_ts,
+                        imu_buffer,
+                    )
+                    lidar_queue.append({"timestamp": base_ts, "points_xyzi": undistorted_xyzi})
+                    timing.tock("lidar_pre")
+                elif topic == camera_topic:
+                    msg_camera += 1
+                    image_queue.append((message_stamp_sec(msg, stamp), msg))
+                    timing.tock("lidar_pre")
+                else:
                     continue
-                timing.tock("img_decode")
 
-                lidar_pose = ie_provider.get_interpolated(float(nearest["timestamp"]))
-                image_pose = ie_provider.get_interpolated(float(img_ts))
-                if lidar_pose is None or image_pose is None:
-                    image_queue.popleft()
-                    continue
-                timing.tock("pose_lookup")
+                while image_queue:
+                    if STOP_REQUESTED or STOP_AFTER_MAX_FRAMES or rospy.is_shutdown():
+                        break
+                    img_ts, img_msg = image_queue[0]
+                    nearest = choose_nearest_lidar(lidar_queue, img_ts, max_sync_dt)
+                    if nearest is None:
+                        break
+                    if args.max_frames is not None and index >= int(args.max_frames):
+                        request_max_frames_stop(args.max_frames)
+                        image_queue.clear()
+                        break
+                    try:
+                        img = decode_image_msg(img_msg)
+                    except Exception as e:
+                        print(f"skip image frame at {img_ts:.3f}: {e}")
+                        image_queue.popleft()
+                        continue
+                    timing.tock("img_decode")
 
-                align_pcd = transform_lidar_points_between_timestamps(
-                    nearest["points_xyzi"],
-                    lidar_pose,
-                    image_pose,
-                    ecef_origin,
-                    enu_from_ecef,
-                )
-                timing.tock("align_pcd")
+                    lidar_pose = ie_provider.get_interpolated(float(nearest["timestamp"]))
+                    image_pose = ie_provider.get_interpolated(float(img_ts))
+                    if lidar_pose is None or image_pose is None:
+                        image_queue.popleft()
+                        continue
+                    timing.tock("pose_lookup")
 
-                if not args.offline:
-                    fixcloud = get_i_pcd_msg(align_pcd)
-                    fixcloud.header.frame_id = "lidar"
-                    fixCloudPubHandle.publish(fixcloud)
-                    timing.tock("publish_io")
+                    align_pcd = transform_lidar_points_between_timestamps(
+                        nearest["points_xyzi"],
+                        lidar_pose,
+                        image_pose,
+                        ecef_origin,
+                        enu_from_ecef,
+                    )
+                    timing.tock("align_pcd")
 
-                index += 1
-                processed_with_lidar += 1
-                print(f"processing frame {index} img_ts={img_ts:.3f} lidar_ts={nearest['timestamp']:.3f}")
-
-                q = ie_pose_to_quaternion_xyzw(image_pose)
-                t_enu = pose_enu_from_ie(image_pose, ecef_origin, enu_from_ecef)
-                pose_save.append(np.array([t_enu[0], t_enu[1], t_enu[2], q[0], q[1], q[2], q[3]], dtype=np.float64))
-
-                R_enu_from_body_cur = rotation_matrix_from_ie(
-                    image_pose.roll_deg, image_pose.pitch_deg, image_pose.heading_deg)
-                R_enu_from_lidar_cur = R_enu_from_body_cur @ R_BASE_FROM_LIDAR
-                t_enu_lidar_cur = R_enu_from_body_cur @ T_FLU_LIDAR_FROM_SPAN + t_enu
-
-                class_plane_coefs_cur = {}
-                for cls_id, est in rolling_planes.items():
-                    coefs = est.fit_in_target_lidar(R_enu_from_lidar_cur, t_enu_lidar_cur)
-                    if coefs is not None:
-                        class_plane_coefs_cur[cls_id] = coefs
-
-                if not args.offline:
-                    imgPubHandle.publish(bri.cv2_to_imgmsg(img))
-                    cv2.imwrite(config["save_folder"] + "/originpics/%06d.png" % index, img)
-                    timing.tock("publish_io")
-
-                sem_pcd_lidar, semimg = get_semantic_pcd(
-                    img,
-                    align_pcd,
-                    camera_matrix,
-                    dist_coeffs,
-                    rotation_lidar_from_camera,
-                    translation_lidar_from_camera,
-                    camera_model,
-                    predictor,
-                    predict_image_scale=predict_image_scale,
-                    min_segment_pixels=min_segment_pixels,
-                    seg_filter_classes=seg_filter_classes,
-                    class_erode_px=class_erode_px,
-                    class_max_depth=class_max_depth,
-                    class_plane_filter=class_plane_filter,
-                    class_plane_coefs=class_plane_coefs_cur,
-                    zbuffer_px=projection_zbuffer_px,
-                    suppress_near_person_px=suppress_near_person_px,
-                    person_class=person_class,
-                )
-                timing.tock("m2f_seg")
-                if not args.offline:
-                    cv2.imwrite(config["save_folder"] + "/sempics/%06d.png" % index, semimg)
-                    semimg_vis = colors[semimg.flatten()].reshape((*semimg.shape, 3))
-                    semimgPubHandle.publish(bri.cv2_to_imgmsg(semimg_vis, "bgr8"))
-                    timing.tock("publish_io")
-
-                if rolling_planes and len(sem_pcd_lidar) > 0:
-                    pts_lidar_xyz = sem_pcd_lidar[:, :3]
-                    cam_z = (rotation_lidar_from_camera.T @ (pts_lidar_xyz - translation_lidar_from_camera).T)[2]
-                    for cls_id, est in rolling_planes.items():
-                        params = class_plane_filter.get(cls_id, {})
-                        fit_depth = float(params.get("fit_max_depth", 3.0))
-                        near_mask = (sem_pcd_lidar[:, 3] == float(cls_id)) & (cam_z <= fit_depth) & (cam_z > 0.0)
-                        if near_mask.any():
-                            est.add(R_enu_from_lidar_cur, t_enu_lidar_cur, pts_lidar_xyz[near_mask])
-                timing.tock("rolling_plane")
-
-                sem_world_pcd = transform_semantic_lidar_to_world(sem_pcd_lidar, image_pose, ecef_origin, enu_from_ecef)
-                pickle.dump(sem_world_pcd, store_file)
-                store_file.flush()
-
-                if len(sem_world_pcd) != 0:
-                    road_world_pcd = sem_world_pcd[sem_world_pcd[:, 3] == road_class]
-                    if len(road_world_pcd) != 0:
-                        pickle.dump(road_world_pcd, road_chunks_file)
-                        road_chunk_count += 1
                     if not args.offline:
-                        sem_msg = get_rgba_pcd_msg(sem_world_pcd)
-                        sem_msg.header.frame_id = "world"
-                        semanticCloudPubHandle.publish(sem_msg)
+                        fixcloud = get_i_pcd_msg(align_pcd)
+                        fixcloud.header.frame_id = "lidar"
+                        fixCloudPubHandle.publish(fixcloud)
+                        timing.tock("publish_io")
+
+                    index += 1
+                    processed_with_lidar += 1
+                    print(f"processing frame {index} img_ts={img_ts:.3f} lidar_ts={nearest['timestamp']:.3f}")
+
+                    q = ie_pose_to_quaternion_xyzw(image_pose)
+                    t_enu = pose_enu_from_ie(image_pose, ecef_origin, enu_from_ecef)
+                    pose_save.append(np.array([t_enu[0], t_enu[1], t_enu[2], q[0], q[1], q[2], q[3]], dtype=np.float64))
+
+                    R_enu_from_body_cur = rotation_matrix_from_ie(
+                        image_pose.roll_deg, image_pose.pitch_deg, image_pose.heading_deg)
+                    R_enu_from_lidar_cur = R_enu_from_body_cur @ R_BASE_FROM_LIDAR
+                    t_enu_lidar_cur = R_enu_from_body_cur @ T_FLU_LIDAR_FROM_SPAN + t_enu
+
+                    class_plane_coefs_cur = {}
+                    for cls_id, est in rolling_planes.items():
+                        coefs = est.fit_in_target_lidar(R_enu_from_lidar_cur, t_enu_lidar_cur)
+                        if coefs is not None:
+                            class_plane_coefs_cur[cls_id] = coefs
+
+                    if not args.offline:
+                        imgPubHandle.publish(bri.cv2_to_imgmsg(img))
+                        cv2.imwrite(config["save_folder"] + "/originpics/%06d.png" % index, img)
+                        timing.tock("publish_io")
+
+                    sem_pcd_lidar, semimg = get_semantic_pcd(
+                        img,
+                        align_pcd,
+                        camera_matrix,
+                        dist_coeffs,
+                        rotation_lidar_from_camera,
+                        translation_lidar_from_camera,
+                        camera_model,
+                        predictor,
+                        predict_image_scale=predict_image_scale,
+                        min_segment_pixels=min_segment_pixels,
+                        seg_filter_classes=seg_filter_classes,
+                        class_erode_px=class_erode_px,
+                        class_max_depth=class_max_depth,
+                        class_plane_filter=class_plane_filter,
+                        class_plane_coefs=class_plane_coefs_cur,
+                        zbuffer_px=projection_zbuffer_px,
+                        suppress_near_person_px=suppress_near_person_px,
+                        person_class=person_class,
+                    )
+                    timing.tock("m2f_seg")
+                    if not args.offline:
+                        cv2.imwrite(config["save_folder"] + "/sempics/%06d.png" % index, semimg)
+                        semimg_vis = colors[semimg.flatten()].reshape((*semimg.shape, 3))
+                        semimgPubHandle.publish(bri.cv2_to_imgmsg(semimg_vis, "bgr8"))
+                        timing.tock("publish_io")
+
+                    if rolling_planes and len(sem_pcd_lidar) > 0:
+                        pts_lidar_xyz = sem_pcd_lidar[:, :3]
+                        cam_z = (rotation_lidar_from_camera.T @ (pts_lidar_xyz - translation_lidar_from_camera).T)[2]
+                        for cls_id, est in rolling_planes.items():
+                            params = class_plane_filter.get(cls_id, {})
+                            fit_depth = float(params.get("fit_max_depth", 3.0))
+                            near_mask = (sem_pcd_lidar[:, 3] == float(cls_id)) & (cam_z <= fit_depth) & (cam_z > 0.0)
+                            if near_mask.any():
+                                est.add(R_enu_from_lidar_cur, t_enu_lidar_cur, pts_lidar_xyz[near_mask])
+                    timing.tock("rolling_plane")
+
+                    sem_world_pcd = transform_semantic_lidar_to_world(sem_pcd_lidar, image_pose, ecef_origin, enu_from_ecef)
+                    pickle.dump(sem_world_pcd, store_file)
+                    store_file.flush()
+
+                    if len(sem_world_pcd) != 0:
+                        road_world_pcd = sem_world_pcd[sem_world_pcd[:, 3] == road_class]
                         if len(road_world_pcd) != 0:
-                            road_msg = get_rgba_pcd_msg(road_world_pcd)
-                            road_msg.header.frame_id = "world"
-                            roadCloudPubHandle.publish(road_msg)
-                elif not args.offline:
-                    print("semantic point publish skipped: empty semantic frame saved for alignment")
-                timing.tock("pcd_save")
-                image_queue.popleft()
-                timing.frame_done()
-            if STOP_REQUESTED or STOP_AFTER_MAX_FRAMES or rospy.is_shutdown():
-                break
+                            pickle.dump(road_world_pcd, road_chunks_file)
+                            road_chunk_count += 1
+                        if not args.offline:
+                            sem_msg = get_rgba_pcd_msg(sem_world_pcd)
+                            sem_msg.header.frame_id = "world"
+                            semanticCloudPubHandle.publish(sem_msg)
+                            if len(road_world_pcd) != 0:
+                                road_msg = get_rgba_pcd_msg(road_world_pcd)
+                                road_msg.header.frame_id = "world"
+                                roadCloudPubHandle.publish(road_msg)
+                    elif not args.offline:
+                        print("semantic point publish skipped: empty semantic frame saved for alignment")
+                    timing.tock("pcd_save")
+                    image_queue.popleft()
+                    timing.frame_done()
+                if STOP_REQUESTED or STOP_AFTER_MAX_FRAMES or rospy.is_shutdown():
+                    break
+            # End of one bag: close and continue to next segment. The
+            # lidar_queue / image_queue / index / pose_save persist across
+            # bags so the last unmatched messages of one segment can pair
+            # with the first of the next.
+            bag.close()
+            bag = None
     except rospy.ROSInterruptException:
         request_stop("rospy.ROSInterruptException")
     except KeyboardInterrupt:
